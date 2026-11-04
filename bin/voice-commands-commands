@@ -1,0 +1,457 @@
+#!/usr/bin/python3 -I
+"""Commands that may run without a yes or no dialog during a voice command.
+
+Three lists, as the user asked on 2026-11-03:
+- system information: commands that read the state of the system and no files, with options only;
+- file commands in the working folder: reading commands whose paths all lie in ~/Voice-Commands;
+- own commands from the settings: a command and the start of its arguments, for example "git status".
+The first two are built in and can each be turned off in the settings (`commands_off`); own commands
+are stored in `own_commands`. Only a plain call counts: no chaining, pipes, redirections, embedded
+commands, variables or brace expansion. Anything else asks as before.
+
+    voice-commands-commands permissions   describes what Claude may do without a dialog right now, for
+                                          its instructions at the start of every voice command.
+    voice-commands-commands check <cwd>   reads the command on stdin. Exit 0: it may run; every path
+                                          it names is printed, one per line, so that the permission
+                                          hook can still ask for places with secrets. Exit 1: ask.
+Also loaded as a module by the response window for the lists and the rules for own commands."""
+import glob
+import json
+import os
+import shlex
+import sys
+from pathlib import Path
+
+HOME = Path.home()
+WORK = HOME / "Voice-Commands"
+SETTINGS_FILE = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "voice-commands" / "settings.json"
+
+# Name: (German, English) description for the settings
+SYSTEM_INFO = {
+    "date": ("Datum und Uhrzeit", "date and time"),
+    "cal": ("Kalender", "calendar"),
+    "uptime": ("Laufzeit des Rechners", "how long the computer has been running"),
+    "whoami": ("eigener Benutzername", "own user name"),
+    "id": ("Benutzer und Gruppen", "user and groups"),
+    "hostname": ("Name des Rechners", "name of the computer"),
+    "uname": ("Systemversion", "system version"),
+    "nproc": ("Anzahl der Prozessorkerne", "number of processor cores"),
+    "free": ("freier Arbeitsspeicher", "free memory"),
+    "df": ("freier Speicherplatz", "free disk space"),
+    "locale": ("Spracheinstellungen", "language settings"),
+}
+WORK_FILES = {
+    "ls": ("Dateien auflisten", "list files"),
+    "find": ("Dateien suchen", "find files"),
+    "tree": ("Ordnerbaum zeigen", "show the folder tree"),
+    "cat": ("Datei anzeigen", "show a file"),
+    "head": ("Anfang einer Datei", "beginning of a file"),
+    "tail": ("Ende einer Datei", "end of a file"),
+    "wc": ("Zeilen und Wörter zählen", "count lines and words"),
+    "file": ("Dateiart erkennen", "detect the file type"),
+    "stat": ("Dateiangaben", "file details"),
+    "du": ("Größe von Ordnern", "size of folders"),
+    "grep": ("in Dateien suchen", "search in files"),
+}
+# Options that would run, delete or write something, or follow links out of the working folder
+WORK_FORBIDDEN = {
+    "find": {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls",
+             "-L", "-follow"},
+    "du": {"-L", "--dereference"},
+    "tree": {"-l", "-o", "-R"},
+    "grep": {"-R", "--dereference-recursive"},
+}
+# Reading programs whose arguments can be checked like those of the built-in file commands. Added as own
+# commands, they get a reach to choose, starting with the working folder. Options that run programs,
+# write files or follow links out of the reach are forbidden. Programs that also read web addresses are
+# left out, because an address would look like a path in the current folder.
+SCOPABLE = {
+    "rg": {"--pre", "--pre-glob", "-z", "--search-zip", "-L", "--follow"},
+    "fd": {"-x", "--exec", "-X", "--exec-batch", "-L", "--follow"},
+    "ag": {"-z", "--search-zip", "-f", "--follow"},
+    "diff": set(), "cmp": set(), "comm": set(),
+    "md5sum": {"-c", "--check"}, "sha1sum": {"-c", "--check"}, "sha256sum": {"-c", "--check"},
+    "sha512sum": {"-c", "--check"}, "b2sum": {"-c", "--check"}, "cksum": {"-c", "--check"},
+    "sort": {"-o", "--output", "-T", "--temporary-directory", "--compress-program"},
+    "nl": set(), "tac": set(), "strings": set(), "od": set(), "hexdump": set(), "base64": set(),
+    "zcat": set(), "xzcat": set(), "bzcat": set(), "zstdcat": {"-o"},
+    "column": set(), "readlink": set(), "realpath": set(), "lsattr": set(), "getfacl": set(),
+    "pdfinfo": set(), "jq": set(), "eza": set(), "lsd": set(),
+}
+# These run any command they are given, or change who runs it: allowing one would turn the dialog off
+NEVER_OWN = {
+    "sudo", "doas", "su", "pkexec", "run0", "bash", "sh", "zsh", "fish", "dash", "ksh", "csh", "tcsh",
+    "python", "python3", "perl", "ruby", "node", "lua", "php", "env", "xargs", "eval", "exec", "command",
+    "builtin", "nohup", "setsid", "timeout", "nice", "ionice", "strace", "ltrace", "gdb", "watch", "flock",
+    "chroot", "unshare", "systemd-run", "busybox", "script", "expect", "parallel",
+}
+# These can be allowed at the user's own risk; adding one names the risk in the confirmation
+RISKS = {
+    "project": {"make", "npm", "npx", "yarn", "pnpm", "bun", "deno", "cargo", "just", "task", "gradle", "mvn",
+                "ninja", "meson", "cmake", "pip", "pip3", "uv", "poetry", "composer", "bundle", "rake", "go",
+                "git"},
+    "change": {"rm", "rmdir", "mv", "cp", "dd", "mkfs", "shred", "truncate", "sed", "awk", "gawk", "find",
+               "chmod", "chown", "ln", "tee", "touch", "mkdir", "pacman", "paru", "yay", "systemctl", "kill",
+               "pkill", "killall"},
+    "network": {"ssh", "scp", "rsync", "curl", "wget", "nc", "ncat", "ftp", "sftp"},
+    "starts": {"vim", "vi", "nvim", "emacs", "nano", "less", "more", "man", "xdg-open", "gio", "open"},
+    # Show access data without naming a file, so the check for places with secrets cannot see it
+    "secrets": {"printenv", "ps", "pgrep", "journalctl", "dmesg", "gpg", "gpg2", "ssh-add", "ssh-keygen",
+                "secret-tool", "pass", "gopass", "gh", "glab", "keepassxc-cli", "bw", "op", "kwallet-query",
+                "kubectl", "docker", "podman", "aws", "gcloud", "az", "doctl", "heroku", "coredumpctl", "nmcli",
+                "locate", "plocate"},
+}
+
+
+def risk(text):
+    """The kind of risk of an own command, or None if none is known; unknown does not mean safe."""
+    parts = words(text) or [""]
+    for kind, names in RISKS.items():
+        if parts[0] in names:
+            return kind
+    return None
+# Characters that would make the shell do more than run one command with these words
+SHELL_SPECIAL = set(";&|`$()<>{}\\\n\r!")
+GLOB = set("*?[")
+
+
+def load_settings():
+    try:
+        value = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def turned_off(settings=None):
+    value = (settings if settings is not None else load_settings()).get("commands_off")
+    return {name for name in value if isinstance(name, str)} if isinstance(value, list) else set()
+
+
+# How far each reading file command reaches without asking, chosen per command in the settings
+# (`file_command_scopes`, asked for by the user on 2026-11-03). Every scope includes the working folder,
+# and places with secrets always ask. "custom" uses the folders in `file_command_custom`.
+SCOPES = ["work", "shared", "personal", "home", "system", "everywhere", "custom"]
+DEFAULT_SCOPE = "work"
+# Where "system" reaches: settings and data of the system, not the home folders
+SYSTEM_PLACES = ["/etc", "/usr", "/opt", "/sys", "/proc"]
+# Personal folders by their XDG names, with common names if the system names none
+PERSONAL = ["DESKTOP", "DOWNLOAD", "DOCUMENTS", "MUSIC", "PICTURES", "VIDEOS"]
+PERSONAL_FALLBACK = ["Desktop", "Downloads", "Documents", "Music", "Pictures", "Videos"]
+
+
+def scope_of(name, settings=None):
+    value = (settings if settings is not None else load_settings()).get("file_command_scopes")
+    scope = value.get(name) if isinstance(value, dict) else None
+    return scope if scope in SCOPES else DEFAULT_SCOPE
+
+
+def custom_folders(name, settings=None):
+    value = (settings if settings is not None else load_settings()).get("file_command_custom")
+    folders = value.get(name) if isinstance(value, dict) else None
+    result = []
+    for path in folders if isinstance(folders, list) else []:
+        if isinstance(path, str) and path.startswith("/"):
+            path = os.path.realpath(path)
+            if path != "/" and path not in result:
+                result.append(path)
+    return result
+
+
+def personal_folders():
+    found = {}
+    try:
+        for line in (Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "user-dirs.dirs").read_text(
+                encoding="utf-8").splitlines():
+            key, _, value = line.partition("=")
+            key = key.strip().removeprefix("XDG_").removesuffix("_DIR")
+            if key in PERSONAL:
+                value = value.strip().strip('"').replace("$HOME", str(HOME))
+                path = os.path.realpath(value) if value.startswith("/") else ""
+                # A folder set to the home folder, or to / or /home, would reach far more than meant
+                if path and path != "/" and not inside(os.path.realpath(HOME), path):
+                    found[key] = path
+    except OSError:
+        pass
+    folders = list(found.values())
+    for key, fallback in zip(PERSONAL, PERSONAL_FALLBACK):
+        if key not in found:
+            folders.append(os.path.realpath(HOME / fallback))
+    return folders
+
+
+def shared_folders(settings):
+    """Folders shared in the settings, for reading at least."""
+    value = settings.get("folders")
+    result = []
+    for item in value if isinstance(value, list) else []:
+        if isinstance(item, dict) and isinstance(item.get("path"), str) and item["path"].startswith("/"):
+            path = os.path.realpath(item["path"])
+            if path != "/":
+                result.append(path)
+    return result
+
+
+def reaches(scope, path, name, settings):
+    """True if a reading file command with this scope may read this path without asking."""
+    if inside(path, str(WORK)):
+        return True
+    if scope == "everywhere":
+        return True
+    if scope == "shared":
+        return any(inside(path, folder) for folder in shared_folders(settings))
+    if scope == "personal":
+        return any(inside(path, folder) for folder in personal_folders())
+    if scope == "home":
+        home = os.path.realpath(HOME)
+        if not inside(path, home) or path == home:
+            return path == home
+        return not any(part.startswith(".") for part in os.path.relpath(path, home).split(os.sep))
+    if scope == "system":
+        if path.startswith("/proc/"):
+            # Information about the system, not about running programs, whose environment can hold keys
+            first = path.split("/")[2]
+            return not (first.isdigit() or first in ("self", "thread-self"))
+        return any(inside(path, place) for place in SYSTEM_PLACES)
+    if scope == "custom":
+        return any(inside(path, folder) for folder in custom_folders(name, settings))
+    return False
+
+
+def reach_text(name, settings):
+    """How far a reading file command reaches without a dialog, in words for Claude."""
+    scope = scope_of(name, settings)
+    if scope == "custom":
+        folders = custom_folders(name, settings)
+        return "working folder" + (" and " + ", ".join(folders) if folders else " only")
+    return {
+        "work": "working folder only",
+        "shared": "working folder and shared folders",
+        "personal": "working folder and personal folders",
+        "home": "home folder except hidden folders",
+        "system": "working folder and system files in " + ", ".join(SYSTEM_PLACES),
+        "everywhere": "everywhere",
+    }[scope]
+
+
+def permissions(settings=None):
+    """What Claude may do without a dialog right now, from the same settings and lists the permission hook
+    uses, so that Claude prefers ways that need no dialog (asked for by the user on 2026-11-03). It grants
+    nothing: the hook still decides every call."""
+    settings = settings if settings is not None else load_settings()
+    off = turned_off(settings)
+    lines = ["Your permissions right now, from the user's current settings. The permission hook enforces "
+             "exactly these; this list only describes them.", "",
+             "Without a dialog:",
+             f"- Read and write in your working folder {WORK} (writing into .git folders asks).",
+             "- Web search and fetching web pages.",
+             "- voice-commands-bg as a plain call: start (with http or https addresses as the only arguments), "
+             "windows, shot, click, focus, type, key, keep and stop. Editors, IDEs, file managers and terminals "
+             "are refused, and the programs run in a protected area that hides places with secrets."]
+    shared = settings.get("folders")
+    for item in shared if isinstance(shared, list) else []:
+        if isinstance(item, dict) and isinstance(item.get("path"), str) and item["path"].startswith("/"):
+            access = "read and write" if item.get("write") is True else "read only"
+            lines.append(f"- Shared folder {item['path']}: {access}, with the Read, Write, Edit, Glob and Grep tools.")
+    info = [name for name in SYSTEM_INFO if name not in off]
+    files = [name for name in WORK_FILES if name not in off]
+    own = [item for item in own_commands(settings) if item["on"]]
+    if info or files or own:
+        lines += ["- These commands, each only as the whole call, with absolute or ~/ paths and wildcards, "
+                  "for example: sha256sum ~/Downloads/*"]
+        if info:
+            lines.append("  - System information, options only: " + ", ".join(info))
+        for name in files:
+            forbidden = sorted(WORK_FORBIDDEN.get(name, set()))
+            lines.append(f"  - {name}: {reach_text(name, settings)}"
+                         + (" (not with " + " ".join(forbidden) + ")" if forbidden else ""))
+        for item in own:
+            name = scopable(item["text"])
+            if name:
+                forbidden = sorted(SCOPABLE[name])
+                lines.append(f"  - {item['text']} (allowed by the user): {reach_text(name, settings)}"
+                             + (" (not with " + " ".join(forbidden) + ")" if forbidden else ""))
+            else:
+                lines.append(f"  - {item['text']} (allowed by the user): anything that starts with it")
+    if any(scope_of(name, settings) == "personal" for name in files) or any(
+            scopable(item["text"]) and scope_of(scopable(item["text"]), settings) == "personal" for item in own):
+        lines.append("  Personal folders: " + ", ".join(personal_folders()))
+    lines += ["",
+              "With a yes or no dialog: everything else. That includes any call that starts with cd or "
+              "combines commands with &&, ;, |, xargs, find -exec, redirection or $(...), even when every part "
+              "is allowed, and places that may hold passwords or keys, such as ~/.ssh or .env files, also "
+              "inside the reach above.",
+              "The Read, Glob and Grep tools reach only the working folder and shared folders without a "
+              "dialog; for other places a command listed above may need none.",
+              "Prefer the ways listed above when they do the job, and make several separate calls instead of "
+              "one combined call. Do not use them to get around a dialog: if a task needs something not "
+              "listed, just try it and let the user decide."]
+    return lines
+
+
+def own_commands(settings=None):
+    """[{"text": "git status", "on": True}, ...] with only valid entries."""
+    value = (settings if settings is not None else load_settings()).get("own_commands")
+    result = []
+    for item in value if isinstance(value, list) else []:
+        if isinstance(item, dict) and isinstance(item.get("text"), str) and own_problem(item["text"]) is None:
+            result.append({"text": item["text"], "on": item.get("on") is not False})
+    return result
+
+
+def words(command):
+    """The words of a plain command, or None if the shell would do anything more with it."""
+    if not command.strip() or any(char in SHELL_SPECIAL for char in command):
+        return None
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return None
+    return parts or None
+
+
+def own_problem(text):
+    """None if the text can be an own command, otherwise a short reason key for the settings."""
+    parts = words(text)
+    if parts is None:
+        return "plain"
+    if "/" in parts[0] or "=" in parts[0]:
+        return "name"
+    if parts[0] in NEVER_OWN:
+        return "never"
+    # Built-in commands follow their own rules, which an own command could never change
+    if parts[0] in WORK_FILES:
+        return "builtin_file"
+    if parts[0] in SYSTEM_INFO:
+        return "builtin_info"
+    if any(GLOB & set(part) for part in parts):
+        return "plain"
+    return None
+
+
+def resolve(path, cwd):
+    if path == "~" or path.startswith("~/"):
+        path = str(HOME) + path[1:]
+    return os.path.realpath(os.path.join(cwd, path))
+
+
+def inside(path, folder):
+    folder = os.path.realpath(folder)
+    return path == folder or path.startswith(folder + "/")
+
+
+def paths_of(argument, cwd):
+    """Every path an argument can stand for, including what a wildcard would match."""
+    if argument.startswith("~") and not (argument == "~" or argument.startswith("~/")):
+        return None  # ~user
+    found = [resolve(argument, cwd)]
+    if GLOB & set(argument):
+        pattern = os.path.join(cwd, os.path.expanduser(argument))
+        found += [os.path.realpath(match) for match in glob.glob(pattern, recursive=True)]
+    return found
+
+
+def check(command, cwd):
+    """Paths named by the command if it may run without asking, otherwise None."""
+    parts = words(command)
+    if parts is None:
+        return None
+    name, arguments = parts[0], parts[1:]
+    settings = load_settings()
+    off = turned_off(settings)
+
+    if name in SYSTEM_INFO and name not in off:
+        # Options and plain numbers only: no file can be named
+        for argument in arguments:
+            if GLOB & set(argument) or "/" in argument or "~" in argument:
+                return None
+            if not (argument[:1] in "-+" or argument.isdigit()):
+                return None
+        return []
+
+    if name in WORK_FILES and name not in off:
+        return within_reach(name, arguments, cwd, settings, WORK_FORBIDDEN.get(name, set()))
+
+    for item in own_commands(settings):
+        start = words(item["text"])
+        if item["on"] and start and parts[:len(start)] == start:
+            if name in SCOPABLE:
+                return within_reach(name, arguments, cwd, settings, SCOPABLE[name])
+            named = []
+            for argument in arguments:
+                if argument.startswith("-"):
+                    # A path can follow "=" or stick to a short option, as in -f~/.ssh/key
+                    if "=" in argument:
+                        value = argument.split("=", 1)[1]
+                    else:
+                        starts = [argument.find(mark) for mark in "/~" if mark in argument]
+                        if not starts:
+                            continue
+                        value = argument[min(starts):]
+                else:
+                    value = argument
+                found = paths_of(value, cwd)
+                if found is None:
+                    return None
+                named += found
+            # Without a path, many programs work through the current folder
+            return named + [os.path.realpath(cwd)]
+    return None
+
+
+def within_reach(name, arguments, cwd, settings, forbidden):
+    """Paths named by a reading file command if all of them lie within its reach, otherwise None."""
+    scope = scope_of(name, settings)
+    named = []
+    for argument in arguments:
+        if argument.startswith("-"):
+            option = argument.split("=", 1)[0]
+            if option in forbidden or option == "--files0-from" or "/" in argument or "~" in argument:
+                return None
+            continue
+        found = paths_of(argument, cwd)
+        if found is None or not all(reaches(scope, path, name, settings) for path in found):
+            return None
+        named += found
+    # The current folder always counts: without a path, or with a search word that looks like one
+    # (grep -r word), these commands work through it
+    here = os.path.realpath(cwd)
+    if not reaches(scope, here, name, settings):
+        return None
+    return named + [here]
+
+
+def scopable(text):
+    """The program of an own command if its reach can be chosen, otherwise None."""
+    parts = words(text)
+    return parts[0] if parts and parts[0] in SCOPABLE else None
+
+
+def scoped_own(settings):
+    """Programs of own commands that are switched on and have a reach to choose."""
+    names = []
+    for item in own_commands(settings):
+        name = scopable(item["text"])
+        if item["on"] and name and name not in names:
+            names.append(name)
+    return names
+
+
+def main():
+    if sys.argv[1:] == ["permissions"]:
+        for line in permissions():
+            print(line)
+        return 0
+    if len(sys.argv) != 3 or sys.argv[1] != "check":
+        print("Usage: voice-commands-commands check <cwd>  (command on stdin)", file=sys.stderr)
+        return 2
+    named = check(sys.stdin.read().rstrip("\n"), sys.argv[2])
+    if named is None:
+        return 1
+    for path in named:
+        print(path)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

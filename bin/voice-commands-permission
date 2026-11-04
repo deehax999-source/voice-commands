@@ -1,0 +1,432 @@
+#!/usr/bin/env bash
+# Decides whether Claude may use a tool during a voice command. Called by Claude Code before each
+# tool use. Claude's own folder needs no permission, and neither do the folders the user shared for
+# good in the settings. Reading or writing anywhere else, and running other commands, asks the user.
+# No answer, or any failure, counts as no.
+set -u
+
+# The own window of Voice Commands; zenity if it cannot be shown. VOICE_COMMANDS_DIALOG replaces both
+# with a program that answers like zenity, for testing.
+DIALOG="${VOICE_COMMANDS_DIALOG:-}"
+ASK="$(dirname -- "$(realpath -m -- "${BASH_SOURCE[0]}")")/voice-commands-ask"
+WORK="$HOME/Voice-Commands"
+DIALOG_SECONDS=120
+# Set for each task by voice-commands. The file exists once the user allowed everything for the task.
+GRANT=""
+# Only in the private runtime folder: in /tmp, another user of the computer could create the file
+if [[ "${VOICE_COMMANDS_TASK:-}" =~ ^[0-9-]+$ ]] && [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -O "$XDG_RUNTIME_DIR" ]; then
+    GRANT="$XDG_RUNTIME_DIR/voice-commands/grants/$VOICE_COMMANDS_TASK"
+fi
+
+locale_value="${VOICE_COMMANDS_LANG:-${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}}"
+if [ "${locale_value%%[_.@]*}" = de ]; then GERMAN=1; else GERMAN=0; fi
+
+decide() {
+    jq -nc --arg d "$1" --arg r "$2" \
+        '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:$d,permissionDecisionReason:$r}}'
+    exit 0
+}
+allow() { decide allow "Allowed by Voice Commands."; }
+deny() { decide deny "$1 Do not try this again or look for another way. Tell the user what you could not do."; }
+
+input="$(cat)"
+tool="$(printf '%s' "$input" | jq -r '.tool_name // empty' 2>/dev/null)" || deny "The request could not be read."
+[ -n "$tool" ] || deny "The request could not be read."
+cwd="$(printf '%s' "$input" | jq -r '.cwd // empty')"
+[ -n "$cwd" ] || cwd="$WORK"
+field() { printf '%s' "$input" | jq -r --arg k "$1" '.tool_input[$k] // empty'; }
+
+# Absolute path with symbolic links and ".." resolved, so that no path can hide where it leads
+resolve() {
+    local p="$1"
+    case "$p" in
+        "~") p="$HOME" ;;
+        "~/"*) p="$HOME/${p#\~/}" ;;
+        /*) ;;
+        *) p="$cwd/$p" ;;
+    esac
+    realpath -m -- "$p" 2>/dev/null || printf '%s' "$p"
+}
+
+inside() { [ "$1" = "$2" ] || [[ "$1" == "$2"/* ]]; }
+
+# Folders shared for good in the settings: "read" or "write" for each folder, resolved like any path.
+# A broken or missing settings file shares nothing.
+SETTINGS="${XDG_CONFIG_HOME:-$HOME/.config}/voice-commands/settings.json"
+SHARED_PATHS=()
+SHARED_WRITE=()
+while IFS=$'\t' read -r shared_path shared_write; do
+    [[ "$shared_path" == /* ]] || continue
+    shared_path="$(realpath -m -- "$shared_path" 2>/dev/null)" || continue
+    # The whole computer can never be shared
+    [ "$shared_path" != / ] || continue
+    SHARED_PATHS+=("$shared_path")
+    SHARED_WRITE+=("$shared_write")
+done < <(jq -r '.folders // [] | .[] | select(type == "object" and (.path | type) == "string")
+    | [.path, (if .write == true then "1" else "0" end)] | @tsv' "$SETTINGS" 2>/dev/null)
+
+# True if the user shared a folder containing this path, for writing if $2 is "write"
+shared() {
+    local i
+    for i in "${!SHARED_PATHS[@]}"; do
+        inside "$1" "${SHARED_PATHS[$i]}" || continue
+        [ "${2:-read}" != write ] || [ "${SHARED_WRITE[$i]}" = 1 ] || continue
+        return 0
+    done
+    return 1
+}
+
+# Writing here could start programs or change what Claude may do, so it asks even in a shared folder
+PROTECTED_PLACES=(
+    .config/voice-commands .claude .local/bin .local/share/applications .config/autostart .config/systemd
+    .config/environment.d .config/hypr .config/fish .bashrc .bash_profile .bash_login .profile .zshrc .zshenv
+    .zprofile .zlogin .xprofile .xinitrc .pam_environment .gitconfig .config/git .config/user-dirs.dirs
+    .bash_logout .zlogout .inputrc .config/mimeapps.list .local/share/dbus-1 .config/plasma-workspace
+    .config/sway .config/i3 .config/niri .config/river .config/labwc .config/openbox
+    .vimrc .vim .config/nvim .config/vim .emacs .emacs.d .config/emacs .config/Code .config/VSCodium
+    .config/Code\ -\ OSS .config/zed .config/helix .tmux.conf .config/tmux .screenrc .config/kitty
+    .config/alacritty .config/foot .config/wezterm .wezterm.lua .config/ghostty .config/konsolerc
+    .local/share/konsole .config/xfce4/terminal .config/fontconfig .config/qutebrowser
+)
+
+protected() {
+    local place here
+    for place in "${PROTECTED_PLACES[@]}"; do
+        inside "$1" "$HOME/$place" && return 0
+    done
+    # The programs of Voice Commands themselves, also when they run from a source folder
+    here="$(dirname -- "$(realpath -m -- "${BASH_SOURCE[0]}")")"
+    inside "$1" "$here" && return 0
+    # From a source folder, Hyprland and Claude Code also load files beside bin/
+    if [ -d "$here/../hypr" ] && [ -d "$here/../skill" ]; then
+        inside "$1" "$(dirname -- "$here")" && return 0
+    fi
+    case "${1##*/}" in .git) return 0 ;; esac
+    [[ "$1" == */.git/hooks/* || "$1" == */.git/config ]] && return 0
+    return 1
+}
+
+SECRET_PLACES=(
+    .ssh .gnupg .pki .aws .azure .kube .docker .password-store .netrc .git-credentials .npmrc .pypirc
+    .claude/.credentials.json .config/gh .config/Bitwarden .config/Claude .config/discord .config/vesktop
+    .config/google-chrome .config/chromium .config/BraveSoftware .mozilla .waterfox .thunderbird
+    .config/mozilla .config/thunderbird .librewolf .config/librewolf .floorp .zen .config/vivaldi .config/opera
+    .config/microsoft-edge .local/share/qutebrowser .Xauthority .ICEauthority
+    .local/share/keyrings .local/share/voice-commands-signing .local/share/TelegramDesktop
+)
+
+has_secrets() {
+    local path="$1" place
+    for place in "${SECRET_PLACES[@]}"; do
+        inside "$path" "$HOME/$place" && return 0
+    done
+    case "${path##*/}" in
+        .env|.env.*|*.pem|*.key|*.p12|*.pfx|id_rsa|id_ed25519|id_ecdsa|*credentials*|*secret*|*password*) return 0 ;;
+    esac
+    # The environment of running programs, which can hold access keys
+    [[ "$path" == /proc/*/environ ]] && return 0
+    return 1
+}
+
+# True if searching this folder would also search a place with secrets
+contains_secrets() {
+    local path="$1" place
+    for place in "${SECRET_PLACES[@]}"; do
+        inside "$HOME/$place" "$path" && return 0
+    done
+    return 1
+}
+
+# Places with secrets always ask, even after the user allowed everything for the task
+ask() {
+    local question="$1" detail="$2" note="${3:-}" yes no all title answer rc
+    local secret=0
+    [ "$note" = "$(text_for secrets)" ] && secret=1
+    if [ "$secret" = 0 ] && [ -n "$GRANT" ] && [ -f "$GRANT" ] && [ -O "$GRANT" ]; then
+        allow
+    fi
+    if [ "$GERMAN" = 1 ]; then
+        title="Voice Commands: Erlaubnis"; yes="Ja"; no="Nein"; all="Für diese Anfrage alle Berechtigungen geben"
+    else
+        title="Voice Commands: Permission"; yes="Yes"; no="No"; all="Give all permissions for this request"
+    fi
+    local extra="" hint=""
+    if [ "$secret" = 0 ] && [ -n "$GRANT" ]; then
+        extra="$all"
+        hint="$(text_for all_note)"
+    fi
+    local round
+    for round in 1 2 3; do
+        answer="$(dialog "$title" "$question" "${detail:0:1500}" "$note" "$hint" "$yes" "$no" "$extra" "")"
+        rc=$?
+        [ "$rc" -eq 0 ] && allow
+        if [ -z "$extra" ] || [ "$answer" != "$all" ]; then
+            deny "The user did not allow this."
+        fi
+        # Giving all permissions needs a second, separate confirmation
+        confirm_all
+        rc=$?
+        if [ "$rc" -eq 0 ]; then
+            mkdir -p -m 700 "${GRANT%/*}" && : >"$GRANT" && allow
+            deny "The permission could not be saved."
+        fi
+        # "Back" returns to the first question, anything else counts as no
+        [ "$rc" -eq 1 ] || deny "The user did not allow this."
+    done
+    deny "The user did not allow this."
+}
+
+# Shows one question and prints the label of the extra button if it was chosen. Exit 0 is yes; anything
+# else is no, except that the caller treats 1 after the extra button as that choice.
+# Arguments: title question detail note hint yes no extra warning
+dialog() {
+    local title="$1" question="$2" detail="$3" note="$4" hint="$5" yes="$6" no="$7" extra="$8" warning="$9"
+    local rc text args
+    if [ -z "$DIALOG" ] && [ -x "$ASK" ]; then
+        args=(--title="$title" --question="$question" --detail="$detail" --note="$note" --hint="$hint"
+              --yes="$yes" --no="$no" --timeout="$DIALOG_SECONDS")
+        [ -z "$extra" ] || args+=(--extra="$extra")
+        [ -z "$warning" ] || args+=(--warning)
+        "$ASK" "${args[@]}" </dev/null 2>/dev/null
+        rc=$?
+        # 3: the window could not be shown, 126 or 127: the program cannot run. Then zenity asks instead.
+        case "$rc" in 3|126|127) ;; *) return "$rc" ;; esac
+    fi
+    text="$question"
+    [ -z "$detail" ] || text="$text"$'\n\n'"$detail"
+    [ -z "$note" ] || text="$text"$'\n\n'"$note"
+    [ -z "$hint" ] || text="$text"$'\n\n'"$hint"
+    args=(--question --no-markup --title="$title" --text="$text" --ok-label="$yes" --cancel-label="$no"
+          --default-cancel --width=560 --timeout="$DIALOG_SECONDS")
+    [ -z "$extra" ] || args+=(--extra-button="$extra")
+    [ -z "$warning" ] || args+=(--icon=dialog-warning)
+    "${DIALOG:-zenity}" "${args[@]}" </dev/null 2>/dev/null
+}
+
+confirm_all() {
+    local title text yes back
+    if [ "$GERMAN" = 1 ]; then
+        title="Warnung: Alle Berechtigungen geben?"
+        yes="Ja, alle Berechtigungen geben"; back="Zurück"
+    else
+        title="Warning: Give all permissions?"
+        yes="Yes, give all permissions"; back="Back"
+    fi
+    text="$(text_for all_warning)"
+    dialog "$title" "${text%%$'\n'*}" "" "${text#*$'\n\n'}" "" "$yes" "$back" "" warning >/dev/null
+}
+
+# Path for people: the home folder as ~
+pretty() {
+    if [ "$1" = "$HOME" ]; then echo "~"
+    elif [[ "$1" == "$HOME"/* ]]; then echo "~/${1#"$HOME"/}"
+    else echo "$1"; fi
+}
+
+# Short name of a file or folder for the sentence in the dialog
+short() {
+    if [ "$1" = "$HOME" ]; then text_for home
+    elif [ "$1" = / ]; then echo /
+    else echo "${1##*/}"; fi
+}
+
+clip() { local t="${1//$'\n'/ }"; [ "${#t}" -le "$2" ] && echo "$t" || echo "${t:0:$2}…"; }
+
+text_for() {
+    local key="$1"; shift
+    if [ "$GERMAN" = 1 ]; then
+        case "$key" in
+            read_file) printf 'Claude möchte die Datei „%s“ lesen.' "$1" ;;
+            read_dir) printf 'Claude möchte sich den Ordner „%s“ ansehen.' "$1" ;;
+            glob) printf 'Claude möchte im Ordner „%s“ nach Dateien suchen, deren Name zu „%s“ passt.' "$1" "$2" ;;
+            grep_dir) printf 'Claude möchte im Ordner „%s“ und allen Unterordnern nach dem Text „%s“ suchen.' "$1" "$2" ;;
+            grep_file) printf 'Claude möchte in der Datei „%s“ nach dem Text „%s“ suchen.' "$1" "$2" ;;
+            write_new) printf 'Claude möchte die neue Datei „%s“ anlegen.' "$1" ;;
+            write_over) printf 'Claude möchte die Datei „%s“ komplett neu schreiben. Ihr bisheriger Inhalt wird dabei ersetzt.' "$1" ;;
+            edit) printf 'Claude möchte die Datei „%s“ ändern.' "$1" ;;
+            place) printf 'Ort: %s' "$1" ;;
+            home) echo "Home-Ordner" ;;
+            run) echo "Claude möchte einen Befehl auf deinem Rechner ausführen." ;;
+            run_desc) printf 'Claudes eigene Beschreibung dazu: „%s“' "$1" ;;
+            command) printf 'Befehl: %s' "$1" ;;
+            run_delete) echo "Achtung: Der Befehl löscht Dateien oder Ordner." ;;
+            run_admin) echo "Achtung: Der Befehl verlangt Administratorrechte." ;;
+            service) printf 'Claude möchte über „%s“ die Aktion „%s“ ausführen.' "$1" "$2" ;;
+            tool) printf 'Claude möchte das Werkzeug „%s“ verwenden.' "$1" ;;
+            inputs) echo "Angaben:" ;;
+            secrets) echo "Hier können Passwörter oder Schlüssel liegen. Inhalte daraus könnten an Anthropic gesendet werden." ;;
+            outside) echo "Das liegt außerhalb deines Home-Ordners." ;;
+            protected) echo "Das liegt in einem freigegebenen Ordner, aber Änderungen hier können Programme starten oder Claudes Rechte ändern. Deshalb fragt Voice Commands trotzdem." ;;
+            read_note) echo "Der Inhalt würde an Anthropic gesendet." ;;
+            all_warning) printf '%s\n\n%s\n%s\n%s\n%s\n\n%s' \
+                "Bist du sicher? Bis zum Ende dieser Anfrage wirst du nicht mehr gefragt." \
+                "Claude kann dann ohne Rückfrage:" \
+                "• Dateien lesen und an Anthropic senden" \
+                "• Dateien ändern oder löschen, auch außerhalb deines Home-Ordners" \
+                "• beliebige Befehle mit deinen Rechten ausführen" \
+                "Das kann mehr sein, als die Aufgabe braucht. Falsch verstandene Befehle oder manipulierte Inhalte von Webseiten können so größeren Schaden anrichten, und Änderungen lassen sich oft nicht rückgängig machen." ;;
+            all_note) echo "„Alle Berechtigungen“ gibt Claude bis zum Ende dieser Anfrage Zugriff auf Dateien und Befehle, möglicherweise mehr als nötig. Du wirst dann nicht mehr gefragt, nur noch, wenn Claude direkt bekannte Orte mit Passwörtern oder Schlüsseln wie ~/.ssh oder .env lesen oder ändern will. Befehle laufen ohne Rückfrage und können auch diese Orte erreichen." ;;
+            run_note) echo "Ein Befehl kann alles tun, was du selbst darfst, auch Dateien löschen." ;;
+            desc_note) echo "Die Beschreibung stammt von Claude selbst. Entscheidend ist, was im Befehl steht." ;;
+        esac
+    else
+        case "$key" in
+            read_file) printf 'Claude wants to read the file "%s".' "$1" ;;
+            read_dir) printf 'Claude wants to look at the folder "%s".' "$1" ;;
+            glob) printf 'Claude wants to search the folder "%s" for files whose name matches "%s".' "$1" "$2" ;;
+            grep_dir) printf 'Claude wants to search the folder "%s" and all its subfolders for the text "%s".' "$1" "$2" ;;
+            grep_file) printf 'Claude wants to search the file "%s" for the text "%s".' "$1" "$2" ;;
+            write_new) printf 'Claude wants to create the new file "%s".' "$1" ;;
+            write_over) printf 'Claude wants to rewrite the file "%s" completely. Its current content will be replaced.' "$1" ;;
+            edit) printf 'Claude wants to change the file "%s".' "$1" ;;
+            place) printf 'Location: %s' "$1" ;;
+            home) echo "home folder" ;;
+            run) echo "Claude wants to run a command on your computer." ;;
+            run_desc) printf 'Claude'"'"'s own description: "%s"' "$1" ;;
+            command) printf 'Command: %s' "$1" ;;
+            run_delete) echo "Warning: this command deletes files or folders." ;;
+            run_admin) echo "Warning: this command asks for administrator rights." ;;
+            service) printf 'Claude wants to use "%s" for the action "%s".' "$1" "$2" ;;
+            tool) printf 'Claude wants to use the tool "%s".' "$1" ;;
+            inputs) echo "Details:" ;;
+            secrets) echo "This place can contain passwords or keys. Its content could be sent to Anthropic." ;;
+            outside) echo "This is outside your home folder." ;;
+            protected) echo "This is in a shared folder, but changes here can start programs or change what Claude may do. That is why Voice Commands asks anyway." ;;
+            read_note) echo "Its content would be sent to Anthropic." ;;
+            all_warning) printf '%s\n\n%s\n%s\n%s\n%s\n\n%s' \
+                "Are you sure? You will not be asked again until this request ends." \
+                "Without asking, Claude can then:" \
+                "• read files and send them to Anthropic" \
+                "• change or delete files, even outside your home folder" \
+                "• run any command with your rights" \
+                "This can be more than the task needs. A misheard command or manipulated website content could do greater damage this way, and changes often cannot be undone." ;;
+            all_note) echo "\"All permissions\" gives Claude access to files and commands until this request ends, possibly more than it needs. You will not be asked again, except when Claude wants to read or change known places with passwords or keys such as ~/.ssh or .env directly. Commands run without asking and can reach these places too." ;;
+            run_note) echo "A command can do anything you can do, including deleting files." ;;
+            desc_note) echo "The description comes from Claude itself. What counts is what the command says." ;;
+        esac
+    fi
+}
+
+case "$tool" in
+    Read|Glob|Grep)
+        target="$(field file_path)"
+        [ -n "$target" ] || target="$(field path)"
+        [ -n "$target" ] || target="$cwd"
+        target="$(resolve "$target")"
+        # A Glob pattern can contain its own absolute path
+        pattern="$(field pattern)"
+        if [ "$tool" = Glob ]; then
+            case "$pattern" in
+                /*|"~"*|*..*) target="$(resolve "${pattern%%[*?\{]*}")" ;;
+            esac
+        fi
+        name="$(short "$target")"
+        case "$tool" in
+            Glob) question="$(text_for glob "$name" "$(clip "${pattern##*/}" 200)")" ;;
+            Grep) if [ -d "$target" ]; then
+                      question="$(text_for grep_dir "$name" "$(clip "$pattern" 200)")"
+                  else
+                      question="$(text_for grep_file "$name" "$(clip "$pattern" 200)")"
+                  fi ;;
+            *) if [ -d "$target" ]; then question="$(text_for read_dir "$name")"
+               else question="$(text_for read_file "$name")"; fi ;;
+        esac
+        place="$(text_for place "$(pretty "$target")")"
+        if has_secrets "$target" || { [ "$tool" = Grep ] && contains_secrets "$target"; }; then
+            ask "$question" "$place" "$(text_for secrets)"
+        fi
+        inside "$target" "$WORK" && allow
+        shared "$target" && allow
+        # Screenshots of the background display, which Claude needs to see what it operates
+        if [ "$tool" = Read ] && [ -n "${XDG_RUNTIME_DIR:-}" ] && inside "$target" "$XDG_RUNTIME_DIR/voice-commands-bg/shots"; then
+            allow
+        fi
+        if ! inside "$target" "$HOME"; then
+            ask "$question" "$place" "$(text_for outside)"
+        fi
+        ask "$question" "$place" "$(text_for read_note)"
+        ;;
+    Write|Edit|NotebookEdit)
+        target="$(field file_path)"
+        [ -n "$target" ] || target="$(field notebook_path)"
+        target="$(resolve "$target")"
+        name="$(short "$target")"
+        if [ "$tool" != Write ]; then question="$(text_for edit "$name")"
+        elif [ -e "$target" ]; then question="$(text_for write_over "$name")"
+        else question="$(text_for write_new "$name")"; fi
+        place="$(text_for place "$(pretty "$target")")"
+        has_secrets "$target" && ask "$question" "$place" "$(text_for secrets)"
+        # Git runs programs named in a project's settings, even for "git status", so a .git folder asks
+        # everywhere, also in the working folder
+        if [[ "/$target/" == */.git/* ]]; then
+            ask "$question" "$place" "$(text_for protected)"
+        fi
+        # The working folder stays tidy: new files go into a subfolder by topic, never loose at the top
+        if [ "$tool" = Write ] && [ ! -e "$target" ] && [ "$(dirname -- "$target")" = "$WORK" ]; then
+            decide deny "Not saved: new files never go loosely into the top of the working folder. Save it in a subfolder by topic instead: look at the existing folders with Glob and use one that fits, otherwise write to a new, clearly named folder in the language of the command, such as $WORK/Rezepte/$(basename -- "$target"). Write creates the folder by itself."
+        fi
+        inside "$target" "$WORK" && allow
+        if shared "$target" write; then
+            protected "$target" && ask "$question" "$place" "$(text_for protected)"
+            allow
+        fi
+        if inside "$target" "$HOME"; then
+            ask "$question" "$place"
+        fi
+        ask "$question" "$place" "$(text_for outside)"
+        ;;
+    Bash)
+        command="$(field command)"
+        # Only a plain call of the background tool goes through without asking. A program it starts gets
+        # no arguments but web addresses, because others could open local files (file://) or run commands
+        if [[ "$command" =~ ^voice-commands-bg([[:space:]]|$) ]] && [[ "$command" != *[\;\&\|\`\$\(\)\<\>]* ]] && [[ "$command" != *$'\n'* ]]; then
+            read -ra bg_words <<<"$command"
+            bg_plain=1
+            if [ "${bg_words[1]:-}" = start ]; then
+                for bg_word in "${bg_words[@]:3}"; do
+                    [[ "$bg_word" =~ ^https?://[^[:space:]\"\'\\]+$ ]] || bg_plain=0
+                done
+            fi
+            [ "$bg_plain" = 0 ] || allow
+        fi
+        # Commands from the list in the settings, as long as they name no place with secrets
+        if listed="$(printf '%s' "$command" | "$(dirname -- "$ASK")/voice-commands-commands" check "$cwd" 2>/dev/null)"; then
+            secret=0
+            while IFS= read -r named; do
+                [ -n "$named" ] || continue
+                if has_secrets "$named" || contains_secrets "$named"; then secret=1; fi
+            done <<<"$listed"
+            [ "$secret" = 0 ] && allow
+        fi
+        question="$(text_for run)"
+        description="$(field description)"
+        [ -z "$description" ] || question="$question"$'\n'"$(text_for run_desc "$(clip "$description" 300)")"
+        note="$(text_for run_note)"
+        [ -z "$description" ] || note="$note"$'\n'"$(text_for desc_note)"
+        # Plain hints for the most dangerous commands; the command itself is always shown
+        words=$'(^|[[:space:];&|(`!{])'
+        if [[ "$command" =~ ${words}(rm|rmdir|shred|unlink)([[:space:]]|$) ]] || [[ "$command" == *" -delete"* ]]; then
+            note="$(text_for run_delete)"$'\n'"$note"
+        fi
+        if [[ "$command" =~ ${words}(sudo|doas|pkexec|su|run0)([[:space:]]|$) ]]; then
+            note="$(text_for run_admin)"$'\n'"$note"
+        fi
+        ask "$question" "$(text_for command "$command")" "$note"
+        ;;
+    WebSearch|WebFetch|ToolSearch|TodoWrite|TaskCreate|TaskGet|TaskList|TaskUpdate)
+        allow
+        ;;
+    *)
+        # Tools of connected services are called mcp__<service>__<action>
+        if [[ "$tool" =~ ^mcp__(.+)__([^_].*)$ ]]; then
+            service="${BASH_REMATCH[1]#claude_ai_}"
+            question="$(text_for service "${service//_/ }" "${BASH_REMATCH[2]//_/ }")"
+        else
+            question="$(text_for tool "$tool")"
+        fi
+        details="$(printf '%s' "$input" | jq -r '.tool_input // {} | to_entries[] |
+            "• \(.key): \(.value | if type == "string" then . else tojson end | gsub("\n"; " ") | .[0:200])"' 2>/dev/null | head -n 8)"
+        [ -z "$details" ] || details="$(text_for inputs)"$'\n'"$details"
+        ask "$question" "$details"
+        ;;
+esac

@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Voice Commands
+GenericName=Voice control
+GenericName[de]=Sprachsteuerung
+Comment=See responses to your voice commands and choose the model
+Comment[de]=Antworten auf deine Sprachbefehle ansehen und das Modell wählen
+Exec=voice-commands-window
+Icon=voice-commands
+Terminal=false
+Categories=Utility;
+Keywords=voice;speech;commands;claude;sprache;sprachbefehle;
+StartupNotify=true
+StartupWMClass=local.voicecommands.VoiceCommands

@@ -1,0 +1,182 @@
+#!/usr/bin/python3 -I
+"""Shared look of Voice Commands: warm paper tones, a copper accent and JetBrains Mono.
+
+Loaded as a module by the response window, the permission dialog and the status bar. The colors and
+shapes are Voice Commands' own; no logo, font or artwork of another product is used."""
+import json
+import os
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gdk", "4.0")
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, Gtk  # noqa: E402
+
+SETTINGS_FILE = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "voice-commands" / "settings.json"
+APPEARANCES = ["system", "light", "dark"]
+
+FONT = '"JetBrains Mono", monospace'
+
+LIGHT = {
+    "bg": "#f6f2ea", "card": "#fffcf6", "raised": "#efe9de", "border": "#e2d9ca", "fg": "#2b2621",
+    "dim": "#6f665b", "accent": "#b4582f", "accent_fg": "#fffaf3", "accent_soft": "rgba(180, 88, 47, 0.12)",
+    "danger": "#b23a2e", "warn": "#9a6400", "warn_soft": "rgba(214, 150, 30, 0.14)", "code": "#f0e9dc",
+    "shadow": "rgba(60, 40, 20, 0.08)",
+}
+DARK = {
+    "bg": "#1f1d1a", "card": "#2a2723", "raised": "#34302b", "border": "#3d3832", "fg": "#ede7dd",
+    "dim": "#a59d90", "accent": "#d47b4e", "accent_fg": "#1f1d1a", "accent_soft": "rgba(212, 123, 78, 0.16)",
+    "danger": "#e0705f", "warn": "#e7b04f", "warn_soft": "rgba(231, 176, 79, 0.12)", "code": "#24221e",
+    "shadow": "rgba(0, 0, 0, 0.25)",
+}
+
+# Overrides libadwaita's named colors, so every standard widget follows the palette
+WINDOW_CSS = """
+:root {{
+    --window-bg-color: {bg}; --window-fg-color: {fg};
+    --view-bg-color: {bg}; --view-fg-color: {fg};
+    --headerbar-bg-color: {bg}; --headerbar-fg-color: {fg}; --headerbar-backdrop-color: {bg};
+    --headerbar-border-color: {border}; --headerbar-shade-color: transparent;
+    --card-bg-color: {card}; --card-fg-color: {fg}; --card-shade-color: {border};
+    --dialog-bg-color: {bg}; --dialog-fg-color: {fg};
+    --popover-bg-color: {card}; --popover-fg-color: {fg};
+    --accent-bg-color: {accent}; --accent-fg-color: {accent_fg}; --accent-color: {accent};
+    --destructive-bg-color: {danger}; --destructive-color: {danger};
+    --warning-color: {warn};
+    --document-font-family: {font}; --monospace-font-family: {font};
+}}
+window, dialog, popover, .vc-root, label, button, entry, text {{ font-family: {font}; }}
+headerbar {{ box-shadow: inset 0 -1px {border}; }}
+.vc-brand {{ font-weight: 700; letter-spacing: 0.02em; }}
+.vc-brand-mark {{ color: {accent}; }}
+
+/* Response cards */
+.vc-card {{
+    background: {card}; border: 1px solid {border}; border-radius: 14px;
+    box-shadow: 0 1px 2px {shadow};
+}}
+.vc-command {{ color: {fg}; font-weight: 600; }}
+.vc-command-mark {{ color: {accent}; }}
+.vc-time {{ color: {dim}; font-size: 0.85em; }}
+.vc-reply {{ color: {fg}; line-height: 1.3; }}
+.vc-rule {{ background: {border}; min-height: 1px; }}
+.vc-action {{
+    background: transparent; color: {dim}; border-radius: 8px; padding: 4px 10px; min-height: 0;
+    font-size: 0.9em; font-weight: 500;
+}}
+.vc-action:hover {{ background: {accent_soft}; color: {accent}; }}
+.vc-action.vc-done {{ color: {accent}; }}
+/* Input window */
+.vc-input-frame {{ background: {code}; border: 1px solid {border}; border-radius: 10px; }}
+.vc-input-frame:focus-within {{ border-color: {accent}; }}
+textview.vc-input, textview.vc-input text {{ background: transparent; color: {fg}; }}
+
+button.vc-file {{
+    background: {raised}; border: 1px solid {border}; border-radius: 8px; padding: 3px 10px; min-height: 0;
+    font-size: 0.9em; font-weight: 500; color: {fg};
+}}
+button.vc-file:hover {{ background: {accent_soft}; color: {accent}; border-color: {accent}; }}
+button.vc-file:disabled {{ opacity: 0.5; }}
+.vc-action.vc-delete:hover {{ background: alpha({danger}, 0.12); color: {danger}; }}
+
+/* Empty state */
+.vc-empty-title {{ font-size: 1.25em; font-weight: 700; }}
+.vc-empty-text {{ color: {dim}; }}
+.vc-key {{
+    background: {raised}; border: 1px solid {border}; border-bottom-width: 2px; border-radius: 6px;
+    padding: 1px 7px; font-weight: 600;
+}}
+
+/* Permission dialog */
+.vc-ask-icon {{ color: {accent}; }}
+.vc-ask-icon.vc-warning {{ color: {warn}; }}
+.vc-ask-title {{ font-size: 1.15em; font-weight: 700; }}
+.vc-ask-detail {{
+    background: {code}; border: 1px solid {border}; border-radius: 10px; padding: 12px 14px;
+}}
+.vc-ask-note {{
+    background: {warn_soft}; border-radius: 10px; padding: 10px 14px; color: {fg};
+}}
+.vc-ask-time {{ color: {dim}; font-size: 0.85em; }}
+progressbar.vc-ask-progress trough {{ min-height: 3px; background: {border}; }}
+progressbar.vc-ask-progress progress {{ min-height: 3px; background: {accent}; }}
+.vc-ask-extra {{ color: {danger}; font-size: 0.9em; }}
+button.vc-yes {{ background: {accent}; color: {accent_fg}; font-weight: 700; }}
+button.vc-yes:disabled {{ opacity: 0.45; }}
+button.vc-no {{ font-weight: 700; }}
+"""
+
+
+def palette(dark):
+    return DARK if dark else LIGHT
+
+
+def window_css(dark):
+    return WINDOW_CSS.format(font=FONT, **palette(dark))
+
+
+def appearance():
+    """The choice in the settings: follow the system, or always light or dark."""
+    try:
+        value = json.loads(SETTINGS_FILE.read_text(encoding="utf-8")).get("appearance")
+    except (OSError, ValueError, AttributeError):
+        value = None
+    return value if value in APPEARANCES else "system"
+
+
+def set_scheme(choice=None):
+    schemes = {"system": Adw.ColorScheme.DEFAULT, "light": Adw.ColorScheme.FORCE_LIGHT,
+               "dark": Adw.ColorScheme.FORCE_DARK}
+    Adw.StyleManager.get_default().set_color_scheme(schemes[choice or appearance()])
+
+
+def apply(display=None, css=None):
+    """Installs the look for this program and follows light and dark mode, also when they change."""
+    Adw.init()
+    css = css or window_css
+    display = display or Gdk.Display.get_default()
+    provider = Gtk.CssProvider()
+    # Above the user's gtk.css: desktop themes such as Noctalia set libadwaita's colors there, which
+    # would otherwise keep the system's light or dark colors whatever the appearance setting says
+    Gtk.StyleContext.add_provider_for_display(display, provider, Gtk.STYLE_PROVIDER_PRIORITY_USER + 1)
+    manager = Adw.StyleManager.get_default()
+    set_scheme()
+
+    def update(*_args):
+        provider.load_from_string(css(manager.get_dark()))
+
+    manager.connect("notify::dark", update)
+    update()
+    return provider
+
+
+# Status bar at the top of the screen
+OVERLAY_CSS = """
+window, window.background {{ background: transparent; }}
+.pill {{
+    background: {pill}; border: 1px solid {pill_border}; border-radius: 999px;
+    padding: 7px 16px 7px 13px; box-shadow: 0 4px 14px {shadow};
+}}
+.text {{ color: {fg}; font-family: {font}; font-size: 13px; font-weight: 600; font-feature-settings: "tnum"; }}
+.dot {{ min-width: 11px; min-height: 11px; border-radius: 999px; }}
+.recording {{ background: {danger}; animation: pulse 0.9s ease-in-out infinite alternate; }}
+.transcribing, .pending, .queued {{ background: {warn}; animation: pulse 0.9s ease-in-out infinite alternate; }}
+.working {{ background: {accent}; animation: pulse 1.6s ease-in-out infinite alternate; }}
+.hints {{ margin-top: 3px; }}
+.key {{
+    font-family: {font}; font-size: 10px; font-weight: 600; color: {fg};
+    background: {raised}; border: 1px solid {border}; border-radius: 5px; padding: 0 5px;
+}}
+.hint {{ font-family: {font}; font-size: 10.5px; color: {dim}; margin-right: 8px; }}
+.hint:last-child {{ margin-right: 0; }}
+@keyframes pulse {{ from {{ opacity: 1; }} to {{ opacity: 0.25; }} }}
+"""
+
+
+def overlay_css(dark):
+    colors = dict(palette(dark))
+    colors["pill"] = "rgba(31, 29, 26, 0.95)" if dark else "rgba(255, 252, 246, 0.97)"
+    colors["pill_border"] = colors["border"]
+    return OVERLAY_CSS.format(font=FONT, **colors)

@@ -1,0 +1,206 @@
+#!/usr/bin/python3 -I
+"""Yes or no window for voice-commands-permission, in the look of Voice Commands.
+
+Answers like zenity --question, so the permission hook treats both the same:
+exit 0 is yes, exit 1 is no (also closing, Escape and the extra button, whose label is printed),
+exit 5 is no answer in time. Exit 3 means the window could not be shown, and the hook then falls
+back to zenity. Anything unclear counts as no."""
+import argparse
+import importlib.util
+import os
+import sys
+import time
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+YES, NO, TIMEOUT, BROKEN = 0, 1, 5, 3
+# "Yes" can only be chosen after this time, so a click or key press already on its way cannot allow anything
+ARM_SECONDS = 1.0
+
+
+def parse():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--title", default="Voice Commands")
+    parser.add_argument("--question", default="")
+    parser.add_argument("--detail", default="")
+    parser.add_argument("--note", default="")
+    parser.add_argument("--hint", default="")
+    parser.add_argument("--yes", default="Yes")
+    parser.add_argument("--no", default="No")
+    parser.add_argument("--extra", default="")
+    parser.add_argument("--warning", action="store_true")
+    parser.add_argument("--timeout", type=int, default=120)
+    return parser.parse_args()
+
+
+def language():
+    for name in ("VOICE_COMMANDS_LANG", "LC_ALL", "LC_MESSAGES", "LANG"):
+        value = os.environ.get(name)
+        if value:
+            return value.split("_")[0].split(".")[0].split("@")[0].lower()
+    return "en"
+
+
+REMAINING = {"de": "Ohne Antwort gilt in {time} Nein.", "en": "Without an answer, this is no in {time}."}
+
+
+def detach():
+    """Shows the window from a process that no longer descends from a terminal.
+
+    Hyprland's window swallowing hides a terminal when a window is started from it. Hyprland finds the
+    terminal through the parent processes, so the window runs in a grandchild that the system adopts.
+    This process waits and passes on its answer. Returns the pipe for the answer in the grandchild."""
+    read_end, write_end = os.pipe()
+    child = os.fork()
+    if child == 0:
+        os.close(read_end)
+        os.setsid()
+        if os.fork() != 0:
+            os._exit(0)
+        return write_end
+    os.close(write_end)
+    os.waitpid(child, 0)
+    answer = b""
+    while chunk := os.read(read_end, 64):
+        answer += chunk
+    # Nothing or anything unexpected means the window could not be shown
+    code = answer.strip()
+    os._exit(int(code) if code in (b"0", b"1", b"5") else BROKEN)
+
+
+def main():
+    args = parse()
+    import gi
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Adw", "1")
+    from gi.repository import Adw, GLib, Gtk
+
+    bin_dir = Path(os.path.realpath(__file__)).parent
+    sys.dont_write_bytecode = True
+    loader = SourceFileLoader("voice_commands_theme", str(bin_dir / "voice-commands-theme"))
+    theme = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(theme)
+
+    result = {"code": NO, "shown": False}
+    remaining_text = REMAINING.get(language(), REMAINING["en"])
+
+    def activate(app):
+        theme.apply()
+        window = Adw.ApplicationWindow(application=app, title=args.title, default_width=600, resizable=False)
+        window.set_icon_name("voice-commands")
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, margin_top=16, margin_bottom=20,
+                          margin_start=24, margin_end=24, css_classes=["vc-root"])
+
+        head = Gtk.Box(spacing=14)
+        icon = Gtk.Image(icon_name="dialog-warning-symbolic" if args.warning else "security-medium-symbolic",
+                         pixel_size=32, valign=Gtk.Align.START, css_classes=["vc-ask-icon"])
+        if args.warning:
+            icon.add_css_class("vc-warning")
+        head.append(icon)
+        # The first line is the question; further lines, such as Claude's own description, come below it
+        title, _, more = args.question.partition("\n")
+        texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, hexpand=True)
+        texts.append(Gtk.Label(label=title, wrap=True, xalign=0, css_classes=["vc-ask-title"]))
+        if more.strip():
+            texts.append(Gtk.Label(label=more.strip(), wrap=True, xalign=0))
+        head.append(texts)
+        content.append(head)
+
+        if args.detail:
+            detail = Gtk.Label(label=args.detail[:1500], wrap=True, xalign=0, selectable=False,
+                               css_classes=["vc-ask-detail"])
+            detail.set_wrap_mode(2)
+            scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, propagate_natural_height=True,
+                                          max_content_height=260)
+            scroller.set_child(detail)
+            content.append(scroller)
+        if args.note:
+            content.append(Gtk.Label(label=args.note, wrap=True, xalign=0, css_classes=["vc-ask-note"]))
+        if args.hint:
+            content.append(Gtk.Label(label=args.hint, wrap=True, xalign=0, css_classes=["dim-label"]))
+
+        progress = Gtk.ProgressBar(fraction=1.0, css_classes=["vc-ask-progress"])
+        clock = Gtk.Label(xalign=0, css_classes=["vc-ask-time"])
+        content.append(progress)
+        content.append(clock)
+
+        buttons = Gtk.Box(spacing=10, homogeneous=True)
+        no = Gtk.Button(label=args.no, css_classes=["pill", "vc-no"])
+        yes = Gtk.Button(label=args.yes, css_classes=["pill", "vc-yes"], sensitive=False)
+        buttons.append(no)
+        buttons.append(yes)
+        content.append(buttons)
+        if args.extra:
+            extra = Gtk.Button(label=args.extra, css_classes=["flat", "vc-ask-extra"], halign=Gtk.Align.CENTER)
+            content.append(extra)
+
+        view = Adw.ToolbarView()
+        header = Adw.HeaderBar(show_start_title_buttons=False)
+        header.set_title_widget(Adw.WindowTitle(title=args.title))
+        view.add_top_bar(header)
+        view.set_content(content)
+        window.set_content(view)
+
+        def finish(code, printed=None):
+            if printed:
+                print(printed, flush=True)
+            result["code"] = code
+            window.destroy()
+
+        no.connect("clicked", lambda _b: finish(NO))
+        yes.connect("clicked", lambda _b: finish(YES))
+        if args.extra:
+            extra.connect("clicked", lambda _b: finish(NO, args.extra))
+        # Closing the window is no
+        window.connect("close-request", lambda _w: (result.__setitem__("code", NO), False)[1])
+
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", lambda _c, keyval, _code, _state:
+                     (finish(NO), True)[1] if keyval == 0xff1b else False)  # Escape
+        window.add_controller(keys)
+
+        started = time.monotonic()
+
+        def tick():
+            left = args.timeout - (time.monotonic() - started)
+            if left <= 0:
+                finish(TIMEOUT)
+                return False
+            if not yes.get_sensitive() and time.monotonic() - started >= ARM_SECONDS:
+                yes.set_sensitive(True)
+            progress.set_fraction(left / args.timeout)
+            seconds = int(left + 0.999)
+            clock.set_text(remaining_text.format(time=f"{seconds // 60}:{seconds % 60:02d}"))
+            return True
+
+        tick()
+        GLib.timeout_add(200, tick)
+        window.present()
+        no.grab_focus()
+        # Selectable only now, so the text does not open with everything selected
+        if args.detail:
+            GLib.timeout_add(300, lambda: (detail.set_selectable(True), no.grab_focus(), False)[2])
+        result["shown"] = True
+
+    app = Adw.Application(application_id="local.voicecommands.VoiceCommands.Ask",
+                          flags=__import__("gi.repository.Gio", fromlist=["Gio"]).ApplicationFlags.NON_UNIQUE)
+    app.connect("activate", activate)
+    app.run([])
+    return result["code"] if result["shown"] else BROKEN
+
+
+if __name__ == "__main__":
+    try:
+        answer = detach()
+    except OSError:
+        answer = None
+    try:
+        code = main()
+    except Exception:  # noqa: BLE001 - any failure must reach the hook as "could not show"
+        code = BROKEN
+    if answer is not None:
+        os.write(answer, str(code).encode())
+        os.close(answer)
+        os._exit(0)
+    sys.exit(code)

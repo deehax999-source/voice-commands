@@ -1,0 +1,195 @@
+#!/usr/bin/python3 -I
+"""Kleine Statusanzeige oben am Bildschirm. Liest $XDG_RUNTIME_DIR/voice-commands/state/<pid>.<phase>
+und beendet sich selbst, sobald nichts mehr laeuft."""
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# gtk4-layer-shell muss vor libwayland geladen werden. Fehlt es, zeigt die Anzeige nichts an:
+# Als normales Fenster wuerde sie unter Hyprland andere Fenster verstecken.
+LAYER_LIB = "/usr/lib/libgtk4-layer-shell.so"
+if not Path(LAYER_LIB).exists():
+    sys.exit(0)
+if LAYER_LIB not in os.environ.get("LD_PRELOAD", ""):
+    os.environ["LD_PRELOAD"] = LAYER_LIB
+    os.execv(sys.executable, [sys.executable, "-I", *sys.argv])
+
+import cairo  # noqa: E402
+import importlib.util  # noqa: E402
+from importlib.machinery import SourceFileLoader  # noqa: E402
+import gi  # noqa: E402
+
+gi.require_version("Gdk", "4.0")
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gtk4LayerShell", "1.0")
+from gi.repository import Gdk, GLib, Gtk, Gtk4LayerShell as LayerShell  # noqa: E402
+
+STATE = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "voice-commands" / "state"
+PRIORITY = ["recording", "transcribing", "pending", "working", "queued"]
+QUIT_AFTER_IDLE = 1.5
+
+BIN = Path(os.path.realpath(__file__)).parent
+sys.dont_write_bytecode = True
+_loader = SourceFileLoader("voice_commands_theme", str(BIN / "voice-commands-theme"))
+_spec = importlib.util.spec_from_loader(_loader.name, _loader)
+THEME = importlib.util.module_from_spec(_spec)
+_loader.exec_module(THEME)
+
+
+def read_active():
+    """Liefert die wichtigste laufende Phase; Eintraege beendeter Prozesse werden entfernt."""
+    active = []
+    if STATE.is_dir():
+        for path in STATE.iterdir():
+            pid, _, phase = path.name.partition(".")
+            if not pid.isdigit() or phase not in PRIORITY or not Path(f"/proc/{pid}").exists():
+                path.unlink(missing_ok=True)
+                continue
+            try:
+                active.append((PRIORITY.index(phase), phase, path.stat().st_mtime, path.read_text().strip()))
+            except OSError:
+                continue
+    return min(active) if active else None
+
+
+def clock(seconds):
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def system_language():
+    for name in ("VOICE_COMMANDS_LANG", "LC_ALL", "LC_MESSAGES", "LANG"):
+        value = os.environ.get(name)
+        if value:
+            return value.split("_")[0].split(".")[0].split("@")[0].lower()
+    return "en"
+
+
+TEXT = {
+    "de": {
+        "recording": "Aufnahme  {time}",
+        "transcribing": "Erkenne Sprache …",
+        "pending": "Startet in {seconds} s",
+        "queued": "Wartet auf die vorherige Aufgabe …",
+        "working": "Claude arbeitet  {time}",
+        "done": "fertig", "send": "sofort senden", "cancel": "abbrechen",
+    },
+    "en": {
+        "recording": "Recording  {time}",
+        "transcribing": "Recognizing speech …",
+        "pending": "Starting in {seconds} s",
+        "queued": "Waiting for the previous task …",
+        "working": "Claude is working  {time}",
+        "done": "finish", "send": "send now", "cancel": "cancel",
+    },
+}
+LABELS = TEXT.get(system_language(), TEXT["en"])
+
+
+def shortcut(action, fallback):
+    helper = Path(os.path.realpath(__file__)).parent / "voice-commands-shortcuts"
+    try:
+        result = subprocess.run([str(helper), "show", action], capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.TimeoutExpired):
+        return fallback
+    return result.stdout.strip() or fallback
+
+
+CANCEL = shortcut("cancel", "Super+Shift+G")
+SEND = shortcut("send", "Super+Ctrl+G")
+TOGGLE = shortcut("toggle", "Super+G")
+
+
+def describe(phase, started, data):
+    elapsed = time.time() - started
+    remaining = max(0, float(data or 0) - elapsed) if phase == "pending" else 0
+    return LABELS[phase].format(time=clock(elapsed), seconds=int(remaining) + 1, cancel=CANCEL)
+
+
+# Shortcuts shown in small type below the status, only while they help: (shortcut, word)
+HINTS = {
+    "recording": [(SEND, "send"), (CANCEL, "cancel")],
+    "pending": [(SEND, "send"), (CANCEL, "cancel")],
+}
+
+
+class Overlay(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Voice Commands Status", decorated=False)
+        LayerShell.init_for_window(self)
+        LayerShell.set_namespace(self, "voice-commands")
+        LayerShell.set_layer(self, LayerShell.Layer.OVERLAY)  # liegt auch ueber Vollbild
+        LayerShell.set_anchor(self, LayerShell.Edge.TOP, True)
+        LayerShell.set_margin(self, LayerShell.Edge.TOP, 10)
+        LayerShell.set_keyboard_mode(self, LayerShell.KeyboardMode.NONE)
+        self.set_focusable(False)
+        self.set_can_target(False)
+
+        self.dot = Gtk.Box(valign=Gtk.Align.CENTER, css_classes=["dot"])
+        self.label = Gtk.Label(css_classes=["text"], xalign=0)
+        self.hints = Gtk.Box(spacing=4, css_classes=["hints"], visible=False)
+        lines = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
+        lines.append(self.label)
+        lines.append(self.hints)
+        pill = Gtk.Box(spacing=9, halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER, css_classes=["pill"])
+        pill.append(self.dot)
+        pill.append(lines)
+        self.set_child(pill)
+
+        self.phase = None
+        self.idle_since = None
+        self.connect("realize", self.on_realize)
+        GLib.timeout_add(200, self.tick)
+        self.tick()
+
+    def on_realize(self, _window):
+        # Klicks gehen durch die Anzeige hindurch
+        self.get_surface().set_input_region(cairo.Region())
+
+    def show_hints(self, phase):
+        while (child := self.hints.get_first_child()) is not None:
+            self.hints.remove(child)
+        for combo, word in HINTS.get(phase, []):
+            self.hints.append(Gtk.Label(label=combo, css_classes=["key"]))
+            self.hints.append(Gtk.Label(label=LABELS[word], css_classes=["hint"]))
+        self.hints.set_visible(phase in HINTS)
+
+    def tick(self):
+        active = read_active()
+        if active is None:
+            self.idle_since = self.idle_since or time.time()
+            self.set_opacity(0)
+            if time.time() - self.idle_since > QUIT_AFTER_IDLE:
+                self.get_application().quit()
+                return False
+            return True
+        self.idle_since = None
+        self.set_opacity(1)
+        _, phase, started, data = active
+        if phase != self.phase:
+            if self.phase:
+                self.dot.remove_css_class(self.phase)
+            self.dot.add_css_class(phase)
+            self.phase = phase
+            self.show_hints(phase)
+        self.label.set_text(describe(phase, started, data))
+        return True
+
+
+def on_activate(app):
+    if app.get_active_window():
+        return
+    # Desktops without layer-shell (X11, GNOME) get no status bar, only the notifications
+    on_wayland = "Wayland" in type(Gdk.Display.get_default()).__name__
+    if not on_wayland or not LayerShell.is_supported():
+        app.quit()
+        return
+    THEME.apply(css=THEME.overlay_css)
+    Overlay(app).present()
+
+
+app = Gtk.Application(application_id="local.voicecommands.VoiceCommandsOverlay")
+app.connect("activate", on_activate)
+app.run(None)

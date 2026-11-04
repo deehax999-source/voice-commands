@@ -1,0 +1,135 @@
+#!/usr/bin/python3 -I
+"""Input window of Voice Commands: type a command for Claude instead of speaking it.
+
+For when speaking is not possible or no microphone is connected. Enter sends, Shift+Enter starts a new
+line, Escape closes. The command runs like a spoken one, through the same queue and permission dialogs,
+but without the time to cancel: it was typed on purpose. Pressing the shortcut again brings the open
+window to the front."""
+import importlib.util
+import os
+import subprocess
+import sys
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+BIN = Path(os.path.realpath(__file__)).parent
+
+
+def language():
+    for name in ("VOICE_COMMANDS_LANG", "LC_ALL", "LC_MESSAGES", "LANG"):
+        value = os.environ.get(name)
+        if value:
+            return value.split("_")[0].split(".")[0].split("@")[0].lower()
+    return "en"
+
+
+TEXT = {
+    "de": {"title": "Befehl eingeben", "question": "Was soll Claude tun?",
+           "hint": "Enter sendet, Shift+Enter beginnt eine neue Zeile, Esc schließt.",
+           "send": "Senden", "cancel": "Abbrechen"},
+    "en": {"title": "Type a command", "question": "What should Claude do?",
+           "hint": "Enter sends, Shift+Enter starts a new line, Esc closes.",
+           "send": "Send", "cancel": "Cancel"},
+}
+LABELS = TEXT.get(language(), TEXT["en"])
+
+
+def detach():
+    """Runs the window in a grandchild that no longer descends from a terminal, because Hyprland's
+    window swallowing would otherwise hide the terminal it was started from."""
+    if os.fork() != 0:
+        os._exit(0)
+    os.setsid()
+    if os.fork() != 0:
+        os._exit(0)
+
+
+def main():
+    import gi
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Adw", "1")
+    from gi.repository import Adw, Gdk, Gtk
+
+    sys.dont_write_bytecode = True
+    loader = SourceFileLoader("voice_commands_theme", str(BIN / "voice-commands-theme"))
+    theme = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(theme)
+
+    def activate(app):
+        # A second press of the shortcut brings the open window to the front
+        if app.get_active_window() is not None:
+            app.get_active_window().present()
+            return
+        theme.apply()
+        window = Adw.ApplicationWindow(application=app, title=LABELS["title"], default_width=560)
+        window.set_icon_name("voice-commands")
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_top=12, margin_bottom=20,
+                          margin_start=24, margin_end=24, css_classes=["vc-root"])
+        content.append(Gtk.Label(label=LABELS["question"], xalign=0, css_classes=["vc-ask-title"]))
+
+        field = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR, accepts_tab=False, top_margin=10, bottom_margin=10,
+                             left_margin=12, right_margin=12, css_classes=["vc-input"])
+        scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, min_content_height=96,
+                                      max_content_height=260, propagate_natural_height=True,
+                                      css_classes=["vc-input-frame"])
+        scroller.set_child(field)
+        content.append(scroller)
+        content.append(Gtk.Label(label=LABELS["hint"], xalign=0, wrap=True, css_classes=["dim-label"]))
+
+        buttons = Gtk.Box(spacing=10, homogeneous=True)
+        cancel = Gtk.Button(label=LABELS["cancel"], css_classes=["pill"])
+        send = Gtk.Button(label=LABELS["send"], css_classes=["pill", "vc-yes"], sensitive=False)
+        buttons.append(cancel)
+        buttons.append(send)
+        content.append(buttons)
+
+        view = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        header.set_title_widget(Adw.WindowTitle(title=LABELS["title"]))
+        view.add_top_bar(header)
+        view.set_content(content)
+        window.set_content(view)
+
+        buffer = field.get_buffer()
+
+        def text():
+            return buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), False).strip()
+
+        buffer.connect("changed", lambda _buffer: send.set_sensitive(bool(text())))
+
+        def submit(*_args):
+            command = text()
+            if not command:
+                return
+            subprocess.Popen([str(BIN / "voice-commands"), "typed", command], start_new_session=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            window.destroy()
+
+        send.connect("clicked", submit)
+        cancel.connect("clicked", lambda _button: window.destroy())
+
+        def key(_controller, keyval, _code, state):
+            if keyval == Gdk.KEY_Escape:
+                window.destroy()
+                return True
+            if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter) and not state & Gdk.ModifierType.SHIFT_MASK:
+                submit()
+                return True
+            return False
+
+        keys = Gtk.EventControllerKey(propagation_phase=Gtk.PropagationPhase.CAPTURE)
+        keys.connect("key-pressed", key)
+        window.add_controller(keys)
+
+        window.present()
+        field.grab_focus()
+
+    app = Adw.Application(application_id="local.voicecommands.VoiceCommands.Input")
+    app.connect("activate", activate)
+    app.run([])
+
+
+if __name__ == "__main__":
+    detach()
+    main()

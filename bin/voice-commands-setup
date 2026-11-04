@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# Sets up Voice Commands for the current user. Safe to run as often as needed.
+set -euo pipefail
+
+BINDIR="$(dirname "$(readlink -f "$0")")"
+# Started from a copy of the source (development mode): use its files instead of the installed package
+SOURCE_ROOT="$(dirname "$BINDIR")"
+if [ -z "${VOICE_COMMANDS_SHARE:-}" ] && [ "$SOURCE_ROOT" != /usr ] && [ -f "$SOURCE_ROOT/hypr/voice-commands.lua" ]; then
+    SHARE="$SOURCE_ROOT"
+else
+    SHARE="${VOICE_COMMANDS_SHARE:-/usr/share/voice-commands}"
+fi
+MODEL_DIR="$HOME/.local/share/voice-commands"
+HF="https://huggingface.co"
+problems=()
+
+step() { printf '\n== %s\n' "$1"; }
+
+[ "$(id -u)" != 0 ] || { echo "Please run this as your normal user, without sudo." >&2; exit 2; }
+
+step "Speech recognition files"
+mkdir -p "$MODEL_DIR"
+# Each file comes from a fixed commit of its Hugging Face repository, not from "main", so that its
+# content cannot change unnoticed, and must match the SHA-256 written here. The values are the ones
+# Hugging Face publishes for these files (for the small .json files, the Git checksum was compared).
+# A file already here is checked too; one that does not match is downloaded again, and a download that
+# does not match is deleted, never used. To change a file, update its commit and checksum together.
+WHISPER_REV=5359861c739e955e79d9a303bcbc70fb988958b1
+VAD_REV=9ffd54a1e1ee413ddf265af9913beaf518d1639b
+PIPER_REV=e7229f7d33a10e145e109b886d661984201ac3c4
+
+# fetch_model NAME URL SHA256
+fetch_model() {
+    local name="$1" url="$2" sum="$3"
+    if [ -s "$MODEL_DIR/$name" ]; then
+        if echo "$sum  $MODEL_DIR/$name" | sha256sum -c --status; then
+            echo "$name is already here."
+            return 0
+        fi
+        echo "$name does not match its checksum, so it is downloaded again."
+        rm -f "$MODEL_DIR/$name"
+    fi
+    echo "Downloading $name ..."
+    if ! curl -fL --retry 3 -o "$MODEL_DIR/$name.part" "$url"; then
+        rm -f "$MODEL_DIR/$name.part"
+        problems+=("$name could not be downloaded. Check your internet connection and run voice-commands-setup again.")
+        return 1
+    fi
+    if ! echo "$sum  $MODEL_DIR/$name.part" | sha256sum -c --status; then
+        rm -f "$MODEL_DIR/$name.part"
+        problems+=("The downloaded $name does not match its checksum and was deleted. Run voice-commands-setup again later; if this keeps happening, the file on Hugging Face has changed, so please report it.")
+        return 1
+    fi
+    mv "$MODEL_DIR/$name.part" "$MODEL_DIR/$name"
+    echo "$name downloaded and checked."
+}
+# A failed file is listed under STILL TO DO at the end; the rest of the setup goes on
+fetch_model ggml-small.bin "$HF/ggerganov/whisper.cpp/resolve/$WHISPER_REV/ggml-small.bin" \
+    1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b || true
+fetch_model ggml-silero-v5.1.2.bin "$HF/ggml-org/whisper-vad/resolve/$VAD_REV/ggml-silero-v5.1.2.bin" \
+    29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf || true
+
+step "Voices for reading responses aloud"
+# Piper from the AUR (piper-tts) or from pipx (piper in ~/.local/bin); voice-commands-speak knows where to look
+if "$BINDIR/voice-commands-speak" piper >/dev/null 2>&1; then
+    # German and English, because Claude answers in the language of the command
+    VOICES="$HF/rhasspy/piper-voices/resolve/$PIPER_REV"
+    mkdir -p "$MODEL_DIR/voices"
+    # fetch_voice SHORT PATH DATASET SHA256_OF_ONNX SHA256_OF_JSON
+    fetch_voice() {
+        local short="$1" path="$2" dataset="$3" sum_onnx="$4" sum_json="$5"
+        # A voice from an older version is replaced, for example the English voice with a research-only license
+        if [ -s "$MODEL_DIR/voices/$short.onnx.json" ] &&
+           [ "$(jq -r '.dataset // empty' "$MODEL_DIR/voices/$short.onnx.json" 2>/dev/null)" != "$dataset" ]; then
+            echo "Replacing the voice voices/$short.onnx with a new one."
+            rm -f "$MODEL_DIR/voices/$short.onnx" "$MODEL_DIR/voices/$short.onnx.json"
+        fi
+        fetch_model "voices/$short.onnx" "$VOICES/$path.onnx" "$sum_onnx" || true
+        fetch_model "voices/$short.onnx.json" "$VOICES/$path.onnx.json" "$sum_json" || true
+    }
+    fetch_voice de de/de_DE/thorsten/medium/de_DE-thorsten-medium thorsten \
+        7e64762d8e5118bb578f2eea6207e1a35a8e0c30595010b666f983fc87bb7819 \
+        974adee790533adb273a1ac88f49027d2a1b8f0f2cf4905954a4791e79264e85
+    fetch_voice en en/en_US/ljspeech/medium/en_US-ljspeech-medium ljspeech \
+        6f52a751e2349abe7a76735eb09dc1875298c77ea2342ffd2fef79ff81b87f22 \
+        141d612cc0a95ed7efc1ca936b845c2364967f2e9217c5dbfcf69fc4d6c65860
+else
+    echo "Piper is not installed, so responses are read with the system voice."
+    echo "For a more natural voice, install piper-tts from the AUR (or with: pipx install piper-tts) and run voice-commands-setup again."
+fi
+
+step "Development mode"
+# Started from a copy of the source, Voice Commands runs from there, so changes take effect right
+# away without installing. Started from the package, it removes those links again.
+NAMES=(voice-commands voice-commands-bg voice-commands-permission voice-commands-overlay voice-commands-setup
+       voice-commands-window voice-commands-markdown voice-commands-speak voice-commands-shortcuts
+       voice-commands-ask voice-commands-theme voice-commands-input voice-commands-commands)
+ICON="$HOME/.local/share/icons/hicolor/scalable/apps/voice-commands.svg"
+LAUNCHER="$HOME/.local/share/applications/local.voicecommands.VoiceCommands.desktop"
+if [ "$SHARE" = "${SOURCE_ROOT:-}" ]; then
+    mkdir -p "$HOME/.local/bin" "$(dirname "$LAUNCHER")"
+    for name in "${NAMES[@]}"; do ln -sfn "$BINDIR/$name" "$HOME/.local/bin/$name"; done
+    sed "s|^Exec=.*|Exec=$BINDIR/voice-commands-window|" "$SOURCE_ROOT/desktop/local.voicecommands.VoiceCommands.desktop" >"$LAUNCHER"
+    echo "X-Voice-Commands-Development=true" >>"$LAUNCHER"
+    mkdir -p "$(dirname "$ICON")"
+    ln -sfn "$SOURCE_ROOT/desktop/voice-commands.svg" "$ICON"
+    echo "Voice Commands now runs from $SOURCE_ROOT. Changes there take effect right away."
+    echo "To use the installed package again, run /usr/bin/voice-commands-setup."
+else
+    removed=0
+    for link in "$HOME"/.local/bin/voice-commands "$HOME"/.local/bin/voice-commands-*; do
+        if [ -L "$link" ] && [[ "$(readlink "$link")" == */bin/voice-commands* ]] && [[ "$(readlink "$link")" != /usr/* ]]; then
+            rm -f "$link"
+            removed=1
+        fi
+    done
+    if [ -L "$ICON" ] && [[ "$(readlink "$ICON")" == */desktop/voice-commands.svg ]] && [[ "$(readlink "$ICON")" != /usr/* ]]; then
+        rm -f "$ICON"
+        removed=1
+    fi
+    if [ -f "$LAUNCHER" ] && grep -q '^X-Voice-Commands-Development=true' "$LAUNCHER"; then
+        rm -f "$LAUNCHER"
+        removed=1
+    fi
+    if [ "$removed" = 1 ]; then
+        echo "Voice Commands runs from the installed package again."
+    else
+        echo "Nothing to do."
+    fi
+fi
+
+step "Claude Code instructions"
+mkdir -p "$HOME/.claude/skills"
+ln -sfn "$SHARE/skill" "$HOME/.claude/skills/voice-commands"
+echo "Claude now knows how to help with Voice Commands."
+
+step "Keyboard shortcuts"
+HYPR="$HOME/.config/hypr"
+shortcuts_added=1
+desktop="$("$BINDIR/voice-commands-shortcuts" desktop)"
+# Plasma and GNOME get their shortcuts through their own shortcut settings, Hyprland through a file it
+# loads from hyprland.lua. Other desktops get the commands to add by hand.
+if [ "$desktop" = kde ] || [ "$desktop" = gnome ]; then
+    if [ "$desktop" = kde ]; then name="Plasma"; place="the system settings under Keyboard, Shortcuts"
+    else name="GNOME"; place="the settings under Keyboard, View and Customize Shortcuts"; fi
+    if VOICE_COMMANDS_SHARE="$SHARE" "$BINDIR/voice-commands-shortcuts" write; then
+        echo "Shortcuts are in $name's keyboard settings. You can change them in the settings of the response window."
+    else
+        shortcuts_added=0
+        problems+=("The keyboard shortcuts could not be added to $name. Run voice-commands-setup again in your $name session, or add them yourself in $place.")
+    fi
+elif [ -f "$HYPR/hyprland.lua" ]; then
+    VOICE_COMMANDS_SHARE="$SHARE" "$BINDIR/voice-commands-shortcuts" write
+    echo "Shortcuts are in your Hyprland settings. You can change them in the settings of the response window."
+elif [ -f "$HYPR/hyprland.conf" ]; then
+    shortcuts_added=0
+    echo "Your Hyprland settings use the classic hyprland.conf, which Voice Commands does not support."
+    problems+=("Voice Commands needs Hyprland's Lua settings (~/.config/hypr/hyprland.lua, Hyprland 0.55 or newer). A newer Hyprland alone is not enough, because it keeps using hyprland.conf. Move your settings to Lua as described in Hyprland's wiki (https://wiki.hypr.land/configuring/), then run voice-commands-setup again.")
+else
+    shortcuts_added=0
+    cat <<EOF
+Your desktop is not Hyprland, KDE Plasma or GNOME, so please add these shortcuts
+yourself in your desktop's keyboard settings:
+  Start or stop recording:   voice-commands toggle
+  Cancel:                    voice-commands cancel
+  Open the response window:  voice-commands-window
+  Send right away:           voice-commands send
+  Type a command:            voice-commands-input
+We suggest Super+G, Super+Shift+G, Super+Alt+G, Super+Ctrl+G and Super+I.
+EOF
+fi
+if [ "$shortcuts_added" = 1 ] && { [ "$desktop" = kde ] || [ "$desktop" = gnome ] || { [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] && command -v hyprctl >/dev/null; }; }; then
+    # Only Hyprland reports errors in its settings; Plasma and GNOME keep theirs in their own services
+    if [ "$desktop" = hyprland ]; then
+        sleep 1
+        errors="$(hyprctl configerrors | tr -d '[:space:]')"
+        [ -z "$errors" ] || problems+=("Hyprland reports a problem with its settings. To see it, run: hyprctl configerrors")
+    fi
+    if ! shortcut_problems="$("$BINDIR/voice-commands-shortcuts" check)"; then
+        problems+=("Some keyboard shortcuts do not work or are also used for something else: ${shortcut_problems//$'\n'/; }. Change them in the settings of the response window.")
+    fi
+fi
+
+step "Background programs"
+# voice-commands-bg runs them in bubblewrap with the home folder as an overlay, which needs the kernel
+# module overlay; the package loads it at boot and when it is installed
+if ! command -v bwrap >/dev/null; then
+    problems+=("bubblewrap is missing, so Claude cannot start background programs. Install it: sudo pacman -S bubblewrap")
+elif ! bwrap --dev-bind / / --overlay-src "$HOME" --tmp-overlay "$HOME" true 2>/dev/null; then
+    problems+=("Background programs need the kernel module overlay, which is not loaded. Load it with: sudo modprobe overlay (the package loads it at every start of the computer). If modprobe says the module is not found, the kernel was updated since the last start: restart the computer.")
+else
+    echo "Background programs can run in their protected area."
+fi
+# The package loads the module at every start; run from a source folder, nothing does that yet
+if [ ! -e /usr/lib/modules-load.d/voice-commands.conf ] && [ ! -e /etc/modules-load.d/voice-commands.conf ]; then
+    problems+=("So that the kernel module overlay is loaded at every start of the computer without the package, run once: echo overlay | sudo tee /etc/modules-load.d/voice-commands.conf")
+fi
+
+step "Claude Code"
+# Claude Code's own installer puts claude in ~/.local/bin, which is often not in PATH; voice-commands looks there too
+PATH="$HOME/.local/bin:$PATH"
+if ! command -v claude >/dev/null; then
+    problems+=("Claude Code is not installed. Instructions: https://code.claude.com/docs/en/setup")
+elif ! claude auth status 2>/dev/null | grep -q '"loggedIn": true'; then
+    problems+=("Claude Code is not signed in. Run 'claude' once and sign in.")
+else
+    echo "Installed and signed in."
+fi
+
+printf '\n'
+if [ "${#problems[@]}" -gt 0 ]; then
+    echo "STILL TO DO:"
+    printf ' - %s\n' "${problems[@]}"
+    exit 1
+fi
+# After the first setup, the response window opens with a short introduction
+if [ ! -e "${XDG_CONFIG_HOME:-$HOME/.config}/voice-commands/welcome-shown" ] && { [ -n "${WAYLAND_DISPLAY:-}" ] || [ -n "${DISPLAY:-}" ]; }; then
+    echo "A window with a short introduction opens now."
+    setsid "$BINDIR/voice-commands-window" >/dev/null 2>&1 </dev/null &
+fi
+if [ "$shortcuts_added" = 1 ]; then
+    echo "All done. Press $("$BINDIR/voice-commands-shortcuts" show toggle) to start recording a voice command."
+else
+    echo "All done. Use the shortcut you set up to start recording a voice command."
+fi

@@ -1,0 +1,20 @@
+# Background programs need the kernel module overlay; from the next start of the computer on, it is
+# loaded by /usr/lib/modules-load.d/voice-commands.conf
+load_overlay() {
+    grep -qw overlay /proc/filesystems 2>/dev/null || modprobe overlay 2>/dev/null ||
+        echo "Voice Commands: could not load the kernel module overlay, probably because the kernel was updated since the last start; background programs work after a restart."
+}
+
+post_install() {
+    load_overlay
+    echo "Voice Commands: To finish, run this once as your normal user: voice-commands-setup"
+}
+
+post_upgrade() {
+    load_overlay
+    echo "Voice Commands was updated. If its keyboard shortcuts changed on Hyprland, run: hyprctl reload"
+}
+
+post_remove() {
+    echo "Voice Commands was removed. On Hyprland, also delete its lines from your hyprland.lua."
+}

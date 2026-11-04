@@ -1,0 +1,26 @@
+# Built package folder (packaging/build-package.sh) and makepkg output
+aur/
+*.pkg.tar.*
+*.src.tar.*
+*.log
+src/
+pkg/
+
+# Python caches
+__pycache__/
+
+# Editors and file managers (Dolphin writes .directory when a folder's view changes)
+*~
+*.swp
+.vscode/
+.idea/
+.directory
+
+# Test recordings and access data that must never be committed
+*.wav
+.env
+
+# Private notes: this computer, the project status and changes before the first public release
+CLAUDE.local.md
+CHANGELOG.local.md
+.claude/settings.local.json

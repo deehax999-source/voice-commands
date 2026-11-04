@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# Reads text aloud. Uses Piper with a more natural voice if it is installed, otherwise the system voice
+# from speech-dispatcher or espeak-ng.
+#   voice-commands-speak [slow|normal|fast]   reads the text on stdin, stopping anything still being read
+#   voice-commands-speak stop                 stops reading; exit code 0 if something was being read
+#   voice-commands-speak engine               prints piper, system or none
+#   voice-commands-speak piper                prints the Piper program; exit code 1 if there is none
+set -u
+
+RUN="${XDG_RUNTIME_DIR:-/tmp}/voice-commands"
+VOICES="$HOME/.local/share/voice-commands/voices"
+PID_FILE="$RUN/speak.pid"
+SPEAK_WAV=""
+mkdir -p "$RUN"
+
+stop() {
+    local pid
+    pid="$(cat "$PID_FILE" 2>/dev/null)" || return 1
+    rm -f "$PID_FILE"
+    [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null || return 1
+    # The reader runs in its own process group, so this also ends the player
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+    command -v spd-say >/dev/null && spd-say --cancel >/dev/null 2>&1
+    return 0
+}
+
+# speech-dispatcher can be installed without any voice, then it would wait forever
+system_voice() {
+    if command -v spd-say >/dev/null && [ -n "$(timeout 5 spd-say -O 2>/dev/null | tail -n +2 | tr -d '[:space:]')" ]; then
+        echo spd-say
+    elif command -v espeak-ng >/dev/null; then
+        echo espeak-ng
+    else
+        return 1
+    fi
+}
+
+# The AUR package piper-tts installs "piper-tts". "pipx install piper-tts" installs "piper" in
+# ~/.local/bin, which is often not in PATH when a shortcut starts Voice Commands. Older packages call
+# it "piper" too, which is also the name of an unrelated program for gaming mice, so a "piper" must
+# show Piper's options.
+piper_command() {
+    local candidate
+    if command -v piper-tts >/dev/null; then
+        echo piper-tts
+        return 0
+    fi
+    for candidate in "$(command -v piper)" "$HOME/.local/bin/piper"; do
+        if [ -n "$candidate" ] && [ -x "$candidate" ] && timeout 10 "$candidate" --help 2>&1 | grep -q -- '--model'; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+piper_voice() { [ -s "$VOICES/$1.onnx" ] && [ -s "$VOICES/$1.onnx.json" ] && echo "$VOICES/$1.onnx"; }
+
+engine() {
+    if piper_command >/dev/null && { piper_voice de >/dev/null || piper_voice en >/dev/null; }; then
+        echo piper
+    elif system_voice >/dev/null; then
+        echo system
+    else
+        echo none
+    fi
+}
+
+# Claude replies in the language of the command, so the voice follows the text, not the system
+language_of() {
+    local words de en
+    words=" $(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alpha:]äöüß' ' ') "
+    de="$(grep -oE ' (der|die|das|und|ist|nicht|ich|du|ein|eine|mit|für|auf|den|dem|wird|habe|kann|sind) ' <<<"$words" | wc -l)"
+    en="$(grep -oE ' (the|and|is|not|you|a|an|with|for|on|of|to|was|have|can|are|it|this) ' <<<"$words" | wc -l)"
+    if [ "$de" -gt "$en" ]; then echo de
+    elif [ "$en" -gt "$de" ]; then echo en
+    else
+        local locale_value="${VOICE_COMMANDS_LANG:-${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}}"
+        [ "${locale_value%%[_.@]*}" = de ] && echo de || echo en
+    fi
+}
+
+play() {
+    local file="$1" player
+    for player in pw-play paplay aplay; do
+        command -v "$player" >/dev/null && { "$player" "$file"; return; }
+    done
+}
+
+speak_piper() {
+    local text="$1" language="$2" factor="$3" voice wav help options=() piper
+    piper="$(piper_command)" || return 1
+    voice="$(piper_voice "$language")" || voice="$(piper_voice de)" || voice="$(piper_voice en)" || return 1
+    wav="$(mktemp "$RUN/speak.XXXXXX.wav")"
+    SPEAK_WAV="$wav"
+    trap 'rm -f "$SPEAK_WAV"' EXIT TERM
+    # The newer Piper writes --length-scale, the older one --length_scale
+    help="$("$piper" --help 2>&1)"
+    case "$help" in
+        *--length-scale*) options=(--length-scale "$factor") ;;
+        *--length_scale*) options=(--length_scale "$factor") ;;
+    esac
+    printf '%s\n' "$text" | "$piper" -m "$voice" -f "$wav" "${options[@]}" >/dev/null 2>&1 || return 1
+    play "$wav"
+}
+
+speak_system() {
+    local text="$1" language="$2" rate="$3"
+    case "$(system_voice)" in
+        spd-say) timeout 300 spd-say --wait -l "$language" -r "$rate" -- "$text" ;;
+        espeak-ng) timeout 300 espeak-ng -v "$language" -s $(( 175 + rate * 175 / 100 )) -- "$text" ;;
+    esac
+}
+
+case "${1:-normal}" in
+    stop) stop; exit ;;
+    engine) engine; exit 0 ;;
+    piper) piper_command; exit ;;
+    __read)
+        # Internal: the actual reading, in its own process group so that "stop" also ends the player
+        echo $$ >"$PID_FILE"
+        kind="$2" language="$3" factor="$4" rate="$5" text="$6"
+        if [ "$kind" != piper ] || ! speak_piper "$text" "$language" "$factor"; then
+            speak_system "$text" "$language" "$rate"
+        fi
+        [ "$(cat "$PID_FILE" 2>/dev/null)" != $$ ] || rm -f "$PID_FILE"
+        exit 0 ;;
+    slow) factor=1.25; rate=-30 ;;
+    fast) factor=0.8; rate=30 ;;
+    *) factor=1.0; rate=0 ;;
+esac
+
+text="$(cat)"
+[ -n "${text//[[:space:]]/}" ] || exit 0
+stop
+kind="$(engine)"
+[ "$kind" != none ] || exit 1
+setsid "$0" __read "$kind" "$(language_of "$text")" "$factor" "$rate" "$text" </dev/null >/dev/null 2>&1 &

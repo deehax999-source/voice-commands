@@ -1,0 +1,639 @@
+#!/usr/bin/env bash
+# Keyboard shortcuts of Voice Commands on Hyprland, KDE Plasma and GNOME, as set in the response window.
+# Each desktop keeps its own shortcuts in settings.json: "shortcuts" for Hyprland, "shortcuts_kde" for
+# Plasma, "shortcuts_gnome" for GNOME.
+#   voice-commands-shortcuts desktop  prints hyprland, kde, gnome or other
+#   voice-commands-shortcuts info    prints the desktop, its settings key, its defaults and whether the
+#                                    shortcuts can be set from the response window, as JSON
+#   voice-commands-shortcuts write   writes the shortcuts into your Hyprland settings and reloads them,
+#                                    on Plasma registers them with its shortcut service (kglobalaccel),
+#                                    and on GNOME adds them as custom shortcuts (gsettings)
+#   voice-commands-shortcuts check   prints one line per problem: "missing <action> <shortcut>" or
+#                                    "conflict <action> <shortcut>", or only "classic" if Hyprland runs
+#                                    without Lua settings; exit code 0 if all work, 1 if not,
+#                                    2 if neither Hyprland, Plasma nor GNOME is running
+#   voice-commands-shortcuts show <action>   prints a shortcut for people, such as Super+Shift+G
+#   voice-commands-shortcuts used "<shortcut>" [keycode]   prints what else the desktop does on these keys,
+#                                    one line each; exit code 0 if they are free, 1 if used, 2 without
+#                                    a supported desktop, 3 if Plasma cannot use this key. The keycode also
+#                                    finds Hyprland binds written as code:<number>.
+#   voice-commands-shortcuts capture start|stop   while a new shortcut is being pressed, the desktop's
+#                                    shortcuts are off, so that keys such as Super+Q reach the window
+#                                    instead of closing it. They come back by themselves after 25 seconds
+#                                    in any case. On GNOME, the window asks GNOME for this itself.
+set -u
+
+BINDIR="$(dirname "$(readlink -f "$0")")"
+# Started from a copy of the source (development mode): use its files instead of the installed package
+SOURCE_ROOT="$(dirname "$BINDIR")"
+if [ -z "${VOICE_COMMANDS_SHARE:-}" ] && [ "$SOURCE_ROOT" != /usr ] && [ -f "$SOURCE_ROOT/hypr/voice-commands.lua" ]; then
+    SHARE="$SOURCE_ROOT"
+else
+    SHARE="${VOICE_COMMANDS_SHARE:-/usr/share/voice-commands}"
+fi
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/voice-commands"
+SETTINGS="$CONFIG/settings.json"
+HYPR="${XDG_CONFIG_HOME:-$HOME/.config}/hypr"
+ACTIONS=(toggle cancel window send type)
+
+# The desktop whose shortcuts count: hyprland, kde, gnome or other. A running Hyprland wins, then the
+# desktop the session names. Without a desktop session (a text console or SSH), Hyprland's Lua settings,
+# Plasma's running shortcut service or a running GNOME Shell of this user decide, in this order.
+# Plasma's service is only asked whether it runs, never started, so other desktops with KDE programs
+# installed are left alone.
+desktop() {
+    if [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]; then echo hyprland; return; fi
+    case ":${XDG_CURRENT_DESKTOP:-}:" in
+        *:KDE:*) echo kde; return ;;
+        *:GNOME:*) echo gnome; return ;;
+        *:Hyprland:*) echo hyprland; return ;;
+        ::) ;;
+        *) echo other; return ;;
+    esac
+    if [ -f "$HYPR/hyprland.lua" ]; then echo hyprland
+    elif gdbus call -e -d org.freedesktop.DBus -o /org/freedesktop/DBus -m org.freedesktop.DBus.NameHasOwner \
+            org.kde.kglobalaccel 2>/dev/null | grep -q true; then echo kde
+    elif pgrep -u "$(id -u)" -x gnome-shell >/dev/null; then echo gnome
+    else echo other
+    fi
+}
+
+# default ACTION [DESKTOP]: the default shortcut, written as in settings.json ("SUPER + SHIFT + G").
+# Plasma already uses Super+G (overview) and Super+I (system settings), so it has its own defaults.
+# Hyprland and GNOME use the G keys; GNOME itself uses Super+H (minimize), so H would not work there.
+default() {
+    if [ "${2:-$(desktop)}" = kde ]; then
+        case "$1" in
+            toggle) echo "SUPER + H" ;;
+            cancel) echo "SUPER + SHIFT + H" ;;
+            window) echo "SUPER + ALT + H" ;;
+            send) echo "SUPER + CTRL + H" ;;
+            type) echo "SUPER + J" ;;
+        esac
+        return
+    fi
+    case "$1" in
+        toggle) echo "SUPER + G" ;;
+        cancel) echo "SUPER + SHIFT + G" ;;
+        window) echo "SUPER + ALT + G" ;;
+        send) echo "SUPER + CTRL + G" ;;
+        type) echo "SUPER + I" ;;
+    esac
+}
+
+# The key in settings.json that holds this desktop's shortcuts. Each desktop has its own, so that
+# switching between desktops on one computer keeps the shortcuts of each.
+settings_key() {
+    case "${1:-$(desktop)}" in kde) echo shortcuts_kde ;; gnome) echo shortcuts_gnome ;; *) echo shortcuts ;; esac
+}
+
+# Only modifiers and a key name: this text is written into Hyprland's settings
+valid() { [[ "$1" =~ ^((SUPER|SHIFT|CTRL|ALT)\ \+\ )*[A-Za-z0-9_]+$ ]]; }
+
+# shortcut ACTION [DESKTOP]: the shortcut set in the response window, or the default if none is set
+# or the stored text is not a valid shortcut
+shortcut() {
+    local value desk="${2:-$(desktop)}"
+    value="$(jq -r --arg k "$(settings_key "$desk")" --arg a "$1" '.[$k][$a] // empty | strings' "$SETTINGS" 2>/dev/null)"
+    valid "$value" && echo "$value" || default "$1" "$desk"
+}
+
+# show ACTION: the shortcut for people, such as Super+Shift+G (Meta+Shift+H on Plasma), as used in
+# notifications, the status bar and the help
+show() {
+    local part out="" desk
+    desk="$(desktop)"
+    IFS='+' read -ra parts <<<"$(shortcut "$1" "$desk")"
+    for part in "${parts[@]}"; do
+        part="${part// /}"
+        # Plasma calls the Super key Meta in its settings
+        case "$part" in SUPER) [ "$desk" = kde ] && part=Meta || part=Super ;; SHIFT) part=Shift ;; CTRL) part=Ctrl ;; ALT) part=Alt ;; esac
+        out="${out:+$out+}$part"
+    done
+    echo "$out"
+}
+
+# info: everything the response window needs to know about this desktop's shortcuts, as one JSON line.
+# can_set is false where the window can only show the shortcuts: on other desktops, and on Hyprland
+# without its Lua settings.
+info() {
+    local desk can=false action defaults="{}"
+    desk="$(desktop)"
+    for action in "${ACTIONS[@]}"; do
+        defaults="$(jq -c --arg a "$action" --arg v "$(default "$action" "$desk")" '.[$a] = $v' <<<"$defaults")"
+    done
+    if [ "$desk" = kde ] || [ "$desk" = gnome ] || { [ "$desk" = hyprland ] && [ -f "$HYPR/hyprland.lua" ]; }; then can=true; fi
+    jq -nc --arg d "$desk" --arg k "$(settings_key "$desk")" --argjson defaults "$defaults" --argjson can "$can" \
+        '{desktop: $d, key: $k, defaults: $defaults, can_set: $can}'
+}
+
+# GNOME: one custom shortcut per action in GNOME's own list (org.gnome.settings-daemon.plugins.media-keys
+# custom-keybindings, at .../custom-keybindings/voice-commands-<action>/). Shortcuts you added yourself
+# stay. Changes take effect at once.
+gnome() {
+    python3 -c "$GNOME_PY" "$BINDIR" "$@"
+}
+
+# One line "action=SUPER + G" per action, as the GNOME helper expects its arguments
+gnome_pairs() {
+    local action
+    for action in "${ACTIONS[@]}"; do printf '%s=%s\n' "$action" "$(shortcut "$action" gnome)"; done
+}
+
+# The Python code stands between single quotes for bash: it must not contain an apostrophe (').
+GNOME_PY='
+import os, sys
+from gi.repository import Gio
+
+BINDIR, command, args = sys.argv[1], sys.argv[2], sys.argv[3:]
+MEDIA = "org.gnome.settings-daemon.plugins.media-keys"
+CUSTOM = MEDIA + ".custom-keybinding"
+OWN = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/voice-commands-"
+ACCEL = {"SUPER": "<Super>", "CTRL": "<Control>", "ALT": "<Alt>", "SHIFT": "<Shift>"}
+# Modifier names GNOME may use in its settings
+ALIASES = {"super": "SUPER", "mod4": "SUPER", "control": "CTRL", "primary": "CTRL", "ctrl": "CTRL",
+           "alt": "ALT", "mod1": "ALT", "shift": "SHIFT"}
+NAMES = {"toggle": ("Start or stop recording", "Aufnahme starten oder beenden"),
+         "cancel": ("Cancel", "Abbrechen"),
+         "window": ("Open the response window", "Antwortfenster öffnen"),
+         "send": ("Send the recognized command now", "Erkannten Befehl sofort senden"),
+         "type": ("Type a command", "Befehl eintippen")}
+EXEC = {"toggle": "voice-commands toggle", "cancel": "voice-commands cancel", "window": "voice-commands-window",
+        "send": "voice-commands send", "type": "voice-commands-input"}
+locale = os.environ.get("LC_ALL") or os.environ.get("LC_MESSAGES") or os.environ.get("LANG") or ""
+GERMAN = locale[:2] == "de"
+
+source = Gio.SettingsSchemaSource.get_default()
+if source is None or source.lookup(MEDIA, True) is None or source.lookup(CUSTOM, True) is None:
+    sys.exit(2)
+
+
+def accel(combo):
+    """SUPER + SHIFT + G -> <Super><Shift>g"""
+    parts = [p.strip() for p in combo.split("+") if p.strip()]
+    key = parts[-1]
+    return "".join(ACCEL[m] for m in parts[:-1]) + (key.lower() if len(key) == 1 else key)
+
+
+def normal(text):
+    """<Super><Shift>G -> ({SUPER, SHIFT}, g), so that differently written shortcuts compare equal."""
+    mods, rest = set(), text.strip()
+    while rest.startswith("<"):
+        end = rest.find(">")
+        if end < 0:
+            return None
+        name = rest[1:end].lower()
+        mods.add(ALIASES.get(name, name.upper()))
+        rest = rest[end + 1:]
+    return (frozenset(mods), rest.lower()) if rest else None
+
+
+def wanted(combo):
+    """SUPER + SHIFT + G -> ({SUPER, SHIFT}, g), to compare with what normal() makes of the text in GNOME."""
+    parts = [p.strip() for p in combo.split("+") if p.strip()]
+    return frozenset(parts[:-1]), parts[-1].lower()
+
+
+def own(action):
+    """The custom shortcut of Voice Commands for this action, at its own path in the settings of GNOME."""
+    return Gio.Settings.new_with_path(CUSTOM, OWN + action + "/")
+
+
+def others_on(combo):
+    """What else GNOME does on these keys, as names for people."""
+    want, found = wanted(combo), []
+    plain, _relocatable = source.list_schemas(True)
+    for schema_id in plain:
+        if "keybindings" not in schema_id and schema_id != MEDIA:
+            continue
+        schema = source.lookup(schema_id, True)
+        settings = Gio.Settings.new(schema_id)
+        for key in schema.list_keys():
+            info = schema.get_key(key)
+            if info.get_value_type().dup_string() not in ("s", "as"):
+                continue
+            value = settings.get_value(key).unpack()
+            if any(normal(v) == want for v in ([value] if isinstance(value, str) else value)):
+                name = info.get_summary() or key
+                if name not in found:
+                    found.append(name)
+    for path in Gio.Settings.new(MEDIA).get_strv("custom-keybindings"):
+        if path.startswith(OWN):
+            continue
+        custom = Gio.Settings.new_with_path(CUSTOM, path)
+        if normal(custom.get_string("binding")) == want:
+            found.append(custom.get_string("name") or custom.get_string("command"))
+    return found
+
+
+def pairs():
+    return [arg.split("=", 1) for arg in args if "=" in arg]
+
+
+def write():
+    """Sets name, command and keys of each custom shortcut of Voice Commands and adds it to the list of
+    custom shortcuts in GNOME, after any the user added."""
+    media = Gio.Settings.new(MEDIA)
+    paths = list(media.get_strv("custom-keybindings"))
+    for action, combo in pairs():
+        program, _, rest = EXEC[action].partition(" ")
+        custom = own(action)
+        custom.set_string("name", "Voice Commands: " + NAMES[action][1 if GERMAN else 0])
+        custom.set_string("command", f"\"{BINDIR}/{program}\"" + (" " + rest if rest else ""))
+        custom.set_string("binding", accel(combo))
+        if OWN + action + "/" not in paths:
+            paths.append(OWN + action + "/")
+    media.set_strv("custom-keybindings", paths)
+    # Written before this program ends
+    Gio.Settings.sync()
+
+
+def check():
+    """Prints a line per shortcut GNOME does not have as set, or that is also used for something else."""
+    problems = 0
+    active = set(Gio.Settings.new(MEDIA).get_strv("custom-keybindings"))
+    for action, combo in pairs():
+        if OWN + action + "/" not in active or normal(own(action).get_string("binding")) != wanted(combo):
+            print(f"missing {action} {combo}")
+            problems = 1
+        elif others_on(combo):
+            print(f"conflict {action} {combo}")
+            problems = 1
+    sys.exit(problems)
+
+
+def used():
+    """Prints what else GNOME does on a shortcut, one line each."""
+    found = others_on(args[0]) if args and args[0].strip() else []
+    if found:
+        print("\n".join(found))
+    sys.exit(1 if found else 0)
+
+
+# Unknown commands end with exit code 2, like a desktop without GNOME settings
+{"write": write, "check": check, "used": used}.get(command, lambda: sys.exit(2))()
+'
+
+# Plasma: its shortcut service kglobalaccel starts each action from a hidden launcher entry of its own
+# (local.voicecommands.<action>.desktop in ~/.local/share/applications). Changes take effect at once.
+kde() {
+    python3 -c "$KDE_PY" "$BINDIR" "$@"
+}
+
+# One line "action=SUPER + H" per action, as the Plasma helper expects its arguments
+kde_pairs() {
+    local action
+    for action in "${ACTIONS[@]}"; do printf '%s=%s\n' "$action" "$(shortcut "$action" kde)"; done
+}
+
+# The Python code stands between single quotes for bash: it must not contain an apostrophe (').
+KDE_PY='
+import os, re, shutil, subprocess, sys
+from pathlib import Path
+from gi.repository import Gio, GLib
+
+BINDIR, command, args = sys.argv[1], sys.argv[2], sys.argv[3:]
+MODS = {"SUPER": (0x10000000, "Meta"), "CTRL": (0x04000000, "Ctrl"), "ALT": (0x08000000, "Alt"),
+        "SHIFT": (0x02000000, "Shift")}
+# Key names as GTK and Hyprland write them, with the code and name Qt (and so Plasma) uses
+NAMED = {"space": (0x20, "Space"), "return": (0x01000004, "Return"), "tab": (0x01000001, "Tab"),
+         "backspace": (0x01000003, "Backspace"), "delete": (0x01000007, "Del"), "insert": (0x01000006, "Ins"),
+         "home": (0x01000010, "Home"), "end": (0x01000011, "End"), "left": (0x01000012, "Left"),
+         "up": (0x01000013, "Up"), "right": (0x01000014, "Right"), "down": (0x01000015, "Down"),
+         "prior": (0x01000016, "PgUp"), "page_up": (0x01000016, "PgUp"), "next": (0x01000017, "PgDown"),
+         "page_down": (0x01000017, "PgDown"), "print": (0x01000009, "Print"), "pause": (0x01000008, "Pause"),
+         "comma": (0x2C, ","), "period": (0x2E, "."), "minus": (0x2D, "-"), "plus": (0x2B, "+"),
+         "numbersign": (0x23, "#"), "less": (0x3C, "<"), "adiaeresis": (0xC4, "Ä"), "odiaeresis": (0xD6, "Ö"),
+         "udiaeresis": (0xDC, "Ü"), "ssharp": (0xDF, "ß")}
+NAMES = {"toggle": ("Start or stop recording", "Aufnahme starten oder beenden"),
+         "cancel": ("Cancel", "Abbrechen"),
+         "window": ("Open the response window", "Antwortfenster öffnen"),
+         "send": ("Send the recognized command now", "Erkannten Befehl sofort senden"),
+         "type": ("Type a command", "Befehl eintippen")}
+EXEC = {"toggle": "voice-commands toggle", "cancel": "voice-commands cancel", "window": "voice-commands-window",
+        "send": "voice-commands send", "type": "voice-commands-input"}
+OWN = "local.voicecommands."
+
+
+def parse(combo):
+    """SUPER + SHIFT + H -> (Qt key code, Meta+Shift+H), or None if Plasma cannot use the key."""
+    parts = [p.strip() for p in combo.split("+") if p.strip()]
+    if not parts:
+        return None
+    code, names = 0, []
+    for part in parts[:-1]:
+        if part not in MODS:
+            return None
+        code |= MODS[part][0]
+        names.append(MODS[part][1])
+    key = parts[-1]
+    if len(key) == 1 and key.isascii() and key.isalnum():
+        base, name = ord(key.upper()), key.upper()
+    elif re.fullmatch(r"F([1-9]|[12][0-9]|3[0-5])", key):
+        base, name = 0x01000030 + int(key[1:]) - 1, key
+    elif key.lower() in NAMED:
+        base, name = NAMED[key.lower()]
+    else:
+        return None
+    return code | base, "+".join(names + [name])
+
+
+try:
+    BUS = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+except GLib.Error:
+    sys.exit(2)
+
+
+def call(method, signature, values, path="/kglobalaccel", interface="org.kde.KGlobalAccel"):
+    # Never starts the service: outside Plasma, nothing should change
+    result = BUS.call_sync("org.kde.kglobalaccel", path, interface, method,
+                           GLib.Variant(signature, values) if signature else None, None,
+                           Gio.DBusCallFlags.NO_AUTO_START, 5000, None)
+    return result.unpack() if result is not None else ()
+
+
+def action_id(action):
+    # kglobalaccel names an action by component, action and their names for people. A launcher entry is
+    # a component named after its file, and its only action is called _launch.
+    name = "Voice Commands: " + NAMES[action][0]
+    return [OWN + action + ".desktop", "_launch", name, name]
+
+
+def keys_of(action):
+    """The key codes Plasma has for this action right now, empty if it does not know the action."""
+    try:
+        return {entry[0][0] for entry in call("shortcutKeys", "(as)", (action_id(action),))[0] if entry[0]}
+    except GLib.Error:
+        return set()
+
+
+def others_on(code):
+    """What else Plasma does on these keys, as names for people."""
+    found = []
+    for entry in call("globalShortcutsByKey", "((ai)(i))", (([code, 0, 0, 0],), (0,)))[0]:
+        action, action_name, component, component_name = entry[:4]
+        if component.startswith(OWN):
+            continue
+        text = component_name if action == "_launch" else f"{action_name} ({component_name})"
+        if text not in found:
+            found.append(text)
+    return found
+
+
+def pairs():
+    """The arguments "action=SUPER + H" as [action, combo] pairs."""
+    return [arg.split("=", 1) for arg in args if "=" in arg]
+
+
+def write():
+    """Writes one hidden launcher entry per action and gives it its key in Plasma."""
+    apps = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "applications"
+    apps.mkdir(parents=True, exist_ok=True)
+    wanted, changed = {}, False
+    for action, combo in pairs():
+        parsed = parse(combo)
+        if parsed is None:
+            continue
+        wanted[action] = parsed[0]
+        program, _, rest = EXEC[action].partition(" ")
+        arguments = " " + rest if rest else ""
+        text = ("[Desktop Entry]\nType=Application\n"
+                f"Name=Voice Commands: {NAMES[action][0]}\nName[de]=Voice Commands: {NAMES[action][1]}\n"
+                "Comment=Keyboard shortcut of Voice Commands. Change it in the settings of the response window.\n"
+                "Comment[de]=Tastenkürzel von Voice Commands. Ändere es in den Einstellungen des Antwortfensters.\n"
+                f"Exec=\"{BINDIR}/{program}\"{arguments}\nIcon=voice-commands\nNoDisplay=true\n"
+                f"X-KDE-Shortcuts={parsed[1]}\n")
+        path = apps / (OWN + action + ".desktop")
+        try:
+            same = path.read_text(encoding="utf-8") == text
+        except OSError:
+            same = False
+        if not same:
+            path.write_text(text, encoding="utf-8")
+            changed = True
+    # Plasma finds new launcher entries through its cache, which otherwise updates only after a while
+    if changed and shutil.which("kbuildsycoca6"):
+        subprocess.run(["kbuildsycoca6"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    for action, code in wanted.items():
+        try:
+            call("doRegister", "(as)", (action_id(action),))
+            # SetPresent (2) and NoAutoloading (4): these keys, not ones Plasma stored earlier
+            call("setShortcutKeys", "(asa(ai)u)", (action_id(action), [([code, 0, 0, 0],)], 6))
+        except GLib.Error:
+            sys.exit(2)
+
+
+def check():
+    """Prints a line per shortcut Plasma does not have as set, or that is also used for something else."""
+    problems = 0
+    for action, combo in pairs():
+        parsed = parse(combo)
+        if parsed is None or parsed[0] not in keys_of(action):
+            print(f"missing {action} {combo}")
+            problems = 1
+        elif others_on(parsed[0]):
+            print(f"conflict {action} {combo}")
+            problems = 1
+    sys.exit(problems)
+
+
+def used():
+    """Prints what else Plasma does on a shortcut; exit code 3 if Plasma cannot use its key at all."""
+    parsed = parse(args[0] if args else "")
+    if parsed is None:
+        sys.exit(3)
+    found = others_on(parsed[0])
+    if found:
+        print("\n".join(found))
+    sys.exit(1 if found else 0)
+
+
+try:
+    if command == "write":
+        write()
+    elif command == "check":
+        check()
+    elif command == "used":
+        used()
+    elif command == "block":
+        # Turns all shortcuts of Plasma off or on again, while a new shortcut is being pressed
+        call("blockGlobalShortcuts", "(b)", (args[0] == "on",))
+    else:
+        sys.exit(2)
+except GLib.Error:
+    sys.exit(2)
+'
+
+write() {
+    mkdir -p "$CONFIG"
+    local action desk wrote=2
+    desk="$(desktop)"
+    if [ "$desk" = kde ] || [ "$desk" = gnome ]; then
+        local pairs
+        mapfile -t pairs < <("${desk}_pairs")
+        "$desk" write "${pairs[@]}" && wrote=0
+    fi
+    {
+        echo "-- Written by Voice Commands. Change the shortcuts in the settings of the response window."
+        echo "return {"
+        for action in "${ACTIONS[@]}"; do echo "    $action = \"$(shortcut "$action" hyprland)\","; done
+        echo "}"
+    } >"$CONFIG/shortcuts.lua.tmp" && mv "$CONFIG/shortcuts.lua.tmp" "$CONFIG/shortcuts.lua"
+
+    # Only Hyprland's Lua settings (hyprland.lua, 0.55 or newer) are supported; newer versions still load a classic hyprland.conf, which is not
+    [ -f "$HYPR/hyprland.lua" ] || return "$wrote"
+    write_lua_loader
+    if [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] && command -v hyprctl >/dev/null; then
+        hyprctl reload >/dev/null
+    fi
+    return 0
+}
+
+# A small file of your own instead of a link to the package: Hyprland then does not reload while the
+# package is updated. If the package file is missing, it reloads once more after a few seconds and only
+# warns if the file is still missing. Your other settings keep working either way.
+write_lua_loader() {
+    local loader="$HYPR/config/voice-commands.lua"
+    mkdir -p "$HYPR/config"
+    if [ -L "$loader" ] || [ ! -e "$loader" ] || grep -q '^-- Voice Commands' "$loader"; then
+        # Only written when it changed, because every change makes Hyprland reload
+        cat >"$loader.new" <<LUA
+-- Voice Commands: loads the keyboard shortcuts from the installed package. Written by voice-commands-setup.
+-- If the package file is missing for a moment during an update, Hyprland reloads once more a few
+-- seconds later, and only shows a warning if it is still missing. Your other settings keep working.
+local file = "$SHARE/hypr/voice-commands.lua"
+VOICE_COMMANDS_BIN = "$BINDIR"
+local loaded, problem = pcall(dofile, file)
+if not loaded then
+    hl.timer(function()
+        local handle = io.open(file, "r")
+        if handle then
+            handle:close()
+            hl.dispatch(hl.dsp.reload_config())
+            return
+        end
+        local de = (os.getenv("LC_ALL") or os.getenv("LC_MESSAGES") or os.getenv("LANG") or ""):sub(1, 2) == "de"
+        hl.notification.create({ timeout = 20000, color = "rgba(e5a50aff)", text = de
+            and ("Voice Commands: Die Tastenkürzel konnten nicht geladen werden. Führe voice-commands-setup aus, oder entferne die Voice-Commands-Zeile aus hyprland.lua, falls du es deinstalliert hast. " .. tostring(problem))
+            or ("Voice Commands: The keyboard shortcuts could not be loaded. Run voice-commands-setup, or remove the Voice Commands line from hyprland.lua if you uninstalled it. " .. tostring(problem)) })
+    end, { timeout = 5000, type = "oneshot" })
+end
+LUA
+        if [ ! -L "$loader" ] && cmp -s "$loader.new" "$loader"; then
+            rm -f "$loader.new"
+        else
+            rm -f "$loader"
+            mv "$loader.new" "$loader"
+        fi
+    fi
+    if grep -q '^require("config.voice-commands")$' "$HYPR/hyprland.lua"; then
+        sed -i 's/^require("config.voice-commands")$/pcall(require, "config.voice-commands")/' "$HYPR/hyprland.lua"
+        echo "Made the Voice Commands line in your Hyprland settings safe during updates."
+    elif ! grep -q 'config.voice-commands' "$HYPR/hyprland.lua"; then
+        printf '\n-- Voice Commands\npcall(require, "config.voice-commands")\n' >>"$HYPR/hyprland.lua"
+        echo "Added to your Hyprland settings."
+    fi
+}
+
+# Hyprland lists modifiers as a number: SHIFT 1, CTRL 4, ALT 8, SUPER 64
+modmask() {
+    local mask=0 part
+    for part in $1; do
+        case "$part" in SHIFT) mask=$((mask | 1)) ;; CTRL) mask=$((mask | 4)) ;; ALT) mask=$((mask | 8)) ;; SUPER) mask=$((mask | 64)) ;; esac
+    done
+    echo "$mask"
+}
+
+check() {
+    local desk
+    desk="$(desktop)"
+    if [ "$desk" = kde ] || [ "$desk" = gnome ]; then
+        local pairs
+        mapfile -t pairs < <("${desk}_pairs")
+        "$desk" check "${pairs[@]}"
+        return
+    fi
+    [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] && command -v hyprctl >/dev/null || return 2
+    local binds action combo key mask count commands problems=0
+    # The classic hyprland.conf is not supported, so its missing shortcuts are not the problem to report
+    if [ ! -f "$HYPR/hyprland.lua" ]; then echo "classic"; return 1; fi
+    binds="$(hyprctl binds -j 2>/dev/null)" || return 2
+    for action in "${ACTIONS[@]}"; do
+        combo="$(shortcut "$action")"
+        key="${combo##* }"
+        mask="$(modmask "${combo//+/ }")"
+        # Found means a bind on these keys that starts a command; any second bind on them is a conflict
+        count="$(jq --arg k "$key" --argjson m "$mask" \
+            '[.[] | select(.modmask == $m and (.key | ascii_downcase) == ($k | ascii_downcase) and .submap == "")] | length' <<<"$binds")"
+        commands="$(jq --arg k "$key" --argjson m "$mask" \
+            '[.[] | select(.modmask == $m and (.key | ascii_downcase) == ($k | ascii_downcase) and .submap == "" and (.dispatcher | test("exec")))] | length' <<<"$binds")"
+        if [ "$commands" = 0 ]; then
+            echo "missing $action $combo"; problems=1
+        elif [ "$count" -gt 1 ]; then
+            echo "conflict $action $combo"; problems=1
+        fi
+    done
+    return "$problems"
+}
+
+# Binds on these keys other than the ones Voice Commands set itself
+used() {
+    local combo="$1" code="${2:-0}" key mask binds action own=0 result
+    [[ "$code" =~ ^[0-9]+$ ]] || code=0
+    case "$(desktop)" in kde) kde used "$combo"; return ;; gnome) gnome used "$combo"; return ;; esac
+    [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] && command -v hyprctl >/dev/null || return 2
+    binds="$(hyprctl binds -j 2>/dev/null)" || return 2
+    key="${combo##* }"
+    mask="$(modmask "${combo//+/ }")"
+    # The current shortcut of an action belongs to Voice Commands: one exec bind on it is its own
+    for action in "${ACTIONS[@]}"; do [ "$(shortcut "$action")" = "$combo" ] && own=1; done
+    result="$(jq -r --arg k "$key" --argjson m "$mask" --argjson own "$own" --argjson c "$code" '
+        [.[] | select(.modmask == $m and .submap == ""
+                      and ((.key != "" and (.key | ascii_downcase) == ($k | ascii_downcase)) or ($c > 0 and .keycode == $c)))]
+        | (if $own == 1 then (map(.dispatcher | test("exec")) | index(true)) as $i
+           | if $i == null then . else del(.[$i]) end else . end)
+        | .[] | (if .description != "" then .description
+                 else (.dispatcher | sub("^HL\\.Dispatcher\\("; "") | sub("\\)$"; "")) end)' <<<"$binds")"
+    [ -z "$result" ] && return 0
+    echo "$result"
+    return 1
+}
+
+CAPTURE="voice-commands-capture"
+capture() {
+    if [ "$(desktop)" = kde ]; then
+        case "$1" in
+            start)
+                kde block on || return 1
+                # Back on by itself, even if the window closes without stopping
+                setsid -f sh -c "sleep 25; gdbus call -e -d org.kde.kglobalaccel -o /kglobalaccel -m org.kde.KGlobalAccel.blockGlobalShortcuts false" \
+                    >/dev/null 2>&1 </dev/null ;;
+            stop) kde block off ;;
+        esac
+        return
+    fi
+    # GNOME turns its shortcuts off for the window itself, after asking the user once
+    [ "$(desktop)" = gnome ] && return 0
+    [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] && command -v hyprctl >/dev/null || return 2
+    case "$1" in
+        start)
+            # Needs the Lua settings; a mode needs one bind to exist, so it gets a key no keyboard has
+            hyprctl eval "hl.define_submap(\"$CAPTURE\", function() hl.bind(\"XF86Launch9\", hl.dsp.submap(\"reset\")) end)" >/dev/null 2>&1 || return 1
+            hyprctl eval "hl.timer(function() if hl.get_current_submap() == \"$CAPTURE\" then hl.dispatch(hl.dsp.submap(\"reset\")) end end, { timeout = 25000, type = \"oneshot\" }) hl.dispatch(hl.dsp.submap(\"$CAPTURE\"))" >/dev/null 2>&1
+            [ "$(hyprctl submap 2>/dev/null)" = "$CAPTURE" ] ;;
+        stop)
+            [ "$(hyprctl submap 2>/dev/null)" = "$CAPTURE" ] || return 0
+            hyprctl eval 'hl.dispatch(hl.dsp.submap("reset"))' >/dev/null 2>&1 ;;
+    esac
+}
+
+case "${1:-}" in
+    desktop) desktop ;;
+    info) info ;;
+    write) write ;;
+    capture) capture "${2:-}" ;;
+    used) used "${2:-}" "${3:-0}" ;;
+    check) check ;;
+    show) show "${2:-toggle}" ;;
+    *) echo "Usage: voice-commands-shortcuts desktop|info|write|check|show <action>|used <shortcut>|capture start|stop" >&2; exit 2 ;;
+esac

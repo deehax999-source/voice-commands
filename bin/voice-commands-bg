@@ -1,0 +1,324 @@
+#!/usr/bin/env bash
+# Unsichtbarer Bildschirm (Xvfb) fuer Programme, die Claude im Hintergrund bedient.
+set -u
+
+DISP=":77"
+WORK="$HOME/Voice-Commands"
+STATE="${XDG_RUNTIME_DIR:-/tmp}/voice-commands-bg"
+# Screenshots live in memory, which the system empties at shutdown and logout, so they are gone even
+# if the programs were never closed. Without a runtime folder they stay in the private working folder.
+if [ -n "${XDG_RUNTIME_DIR:-}" ]; then SHOTS="$STATE/shots"; else SHOTS="$WORK/shots"; fi
+mkdir -p "$SHOTS" "$STATE"
+chmod 700 "$STATE" "$SHOTS" 2>/dev/null
+# Earlier versions kept screenshots in the working folder
+if [ "$SHOTS" != "$WORK/shots" ] && [ -d "$WORK/shots" ]; then
+    rm -f "$WORK/shots"/*.png
+    rmdir "$WORK/shots" 2>/dev/null
+fi
+export DISPLAY="$DISP"
+
+# Programme schliessen sich nach dieser Zeit ohne Aktivitaet
+IDLE_SECONDS="${VOICE_COMMANDS_BG_IDLE_SECONDS:-900}"
+CHECK_SECONDS="${VOICE_COMMANDS_BG_CHECK_SECONDS:-30}"
+VOICE_STATE="${XDG_RUNTIME_DIR:-/tmp}/voice-commands/state"
+
+display_up() { pgrep -f "^Xvfb $DISP " >/dev/null; }
+
+task_running() {
+    local f pid
+    for f in "$VOICE_STATE"/*.working; do
+        [ -e "$f" ] || continue
+        pid="$(basename "$f" .working)"
+        [ -d "/proc/$pid" ] && return 0
+    done
+    return 1
+}
+
+stop_all() {
+    local p pids=()
+    if [ -f "$STATE/pids" ]; then
+        mapfile -t pids <"$STATE/pids"
+        rm -f "$STATE/pids"
+    fi
+    # Jedes Programm hat eine eigene Prozessgruppe, so enden auch seine Unterprozesse
+    for p in "${pids[@]}"; do kill -TERM -- "-$p" 2>/dev/null; done
+    pkill -f "^Xvfb $DISP " 2>/dev/null
+    for _ in $(seq 1 30); do
+        local left=0
+        for p in "${pids[@]}"; do kill -0 -- "-$p" 2>/dev/null && left=1; done
+        [ "$left" = 0 ] && break
+        sleep 0.1
+    done
+    for p in "${pids[@]}"; do kill -KILL -- "-$p" 2>/dev/null; done
+    rm -f "$STATE/keep-until"
+    # Screenshots show what the programs displayed, so they are not kept once the programs are closed
+    rm -f "$SHOTS"/*.png
+    : >"$STATE/apps.log"
+}
+
+watch_idle() {
+    exec 8>"$STATE/watch.lock"
+    flock -n 8 || exit 0
+    while display_up; do
+        sleep "$CHECK_SECONDS"
+        # Solange eine Aufgabe laeuft, beginnt die Wartezeit nicht
+        if task_running; then touch "$STATE/activity"; continue; fi
+        [ -f "$STATE/keep-until" ] && [ "$(date +%s)" -lt "$(cat "$STATE/keep-until")" ] && continue
+        last="$(stat -c %Y "$STATE/activity" 2>/dev/null || echo 0)"
+        if [ $(( $(date +%s) - last )) -ge "$IDLE_SECONDS" ]; then
+            stop_all
+            locale_value="${VOICE_COMMANDS_LANG:-${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}}"
+            if [ "${locale_value%%[_.@]*}" = de ]; then
+                notify-send -a "Voice Commands" "Hintergrundprogramme geschlossen" \
+                    "Sie waren $(( IDLE_SECONDS / 60 )) Minuten lang unbenutzt."
+            else
+                notify-send -a "Voice Commands" "Background programs closed" \
+                    "They had not been used for $(( IDLE_SECONDS / 60 )) minutes."
+            fi
+            exit 0
+        fi
+    done
+}
+
+ensure_display() {
+    start_watch() { setsid nohup "$0" watch >/dev/null 2>&1 </dev/null & }
+    if display_up && [ -S "/tmp/.X11-unix/X${DISP#:}" ]; then
+        start_watch
+        return 0
+    fi
+    setsid nohup Xvfb "$DISP" -screen 0 1920x1080x24 -nolisten tcp >"$STATE/xvfb.log" 2>&1 </dev/null &
+    for _ in $(seq 1 50); do
+        if display_up && [ -S "/tmp/.X11-unix/X${DISP#:}" ]; then
+            start_watch
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "Error: Xvfb did not start, see $STATE/xvfb.log" >&2
+    exit 1
+}
+
+# Programs that run commands or have a terminal built in. Claude operates background programs without a
+# dialog, so one of these would turn every dialog off: editors and IDEs (Emacs --eval, terminal panels)
+# and file managers that open a terminal or run commands.
+NEVER_PROGRAMS=(
+    emacs emacsclient gvim vim nvim nvim-qt neovide code code-oss codium vscodium cursor zed zeditor kate
+    geany gnome-builder idea pycharm clion webstorm goland rider phpstorm rubymine datagrip android-studio
+    studio jetbrains-toolbox eclipse netbeans qtcreator kdevelop lapce helix hx sublime_text subl
+    dolphin krusader thunar mc doublecmd spacefm pcmanfm pcmanfm-qt nemo caja
+    yakuake guake tilda terminator
+)
+
+# Places with secrets, the same list as SECRET_PLACES in voice-commands-permission (the tests check that
+# both agree). Background programs never see them: Claude operates these programs without a dialog, and a
+# browser could otherwise open such a file through its address bar and show it in a screenshot.
+SECRET_PLACES=(
+    .ssh .gnupg .pki .aws .azure .kube .docker .password-store .netrc .git-credentials .npmrc .pypirc
+    .claude/.credentials.json .config/gh .config/Bitwarden .config/Claude .config/discord .config/vesktop
+    .config/google-chrome .config/chromium .config/BraveSoftware .mozilla .waterfox .thunderbird
+    .config/mozilla .config/thunderbird .librewolf .config/librewolf .floorp .zen .config/vivaldi .config/opera
+    .config/microsoft-edge .local/share/qutebrowser .Xauthority .ICEauthority
+    .local/share/keyrings .local/share/voice-commands-signing .local/share/TelegramDesktop
+)
+
+# Arguments for bubblewrap. The programs see the system as it is, with these exceptions:
+# - The home folder is an overlay: they can write in it as usual, but changes go to a hidden layer in
+#   memory and are gone when the program ends, so nothing can leave startup files, autostart entries or
+#   settings behind. Only the working folder is written for real; downloads go to its folder Downloads.
+# - Each place with secrets is an empty folder or file. Browser profiles are among these places, so a
+#   background browser starts with an empty profile and none of the user's logins.
+# - The runtime folder ($XDG_RUNTIME_DIR) is empty: the session's D-Bus, the sockets of Hyprland and
+#   Wayland, the SSH agent and the data of Voice Commands, such as the file that gives all permissions
+#   for a command, are out of reach. Through the bus or Hyprland, a program could otherwise start
+#   commands outside (systemd-run --user, hyprctl dispatch exec).
+# - Of the X displays, only the invisible one can be reached, because the user's own XWayland display
+#   accepts any program of the user and would let it type into the user's windows.
+# - Other processes, with their environment, are out of sight.
+sandbox_args() {
+    local place path real home work dirs
+    home="$(realpath -e -- "$HOME")" || return 1
+    mkdir -p "$WORK/Downloads"
+    work="$(realpath -e -- "$WORK")" || return 1
+    SANDBOX=(--dev-bind / / --overlay-src "$home" --tmp-overlay "$home"
+             --unshare-pid --proc /proc --new-session)
+    for place in "${SECRET_PLACES[@]}"; do
+        path="$HOME/$place"
+        [ -e "$path" ] || continue
+        # A link is followed, so that hiding it also hides what it points to
+        real="$(realpath -e -- "$path" 2>/dev/null)" || continue
+        if [ -d "$real" ]; then
+            SANDBOX+=(--tmpfs "$real")
+        else
+            SANDBOX+=(--ro-bind /dev/null "$real")
+        fi
+    done
+    SANDBOX+=(--bind "$work" "$work")
+    shared_write_args "$home"
+    if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "$XDG_RUNTIME_DIR" ]; then
+        SANDBOX+=(--perms 0700 --tmpfs "$(realpath -e -- "$XDG_RUNTIME_DIR")")
+    fi
+    SANDBOX+=(--unsetenv DBUS_SESSION_BUS_ADDRESS --unsetenv SSH_AUTH_SOCK --unsetenv GNOME_KEYRING_CONTROL
+              --unsetenv XAUTHORITY)
+    # The invisible display exists only once it has started; until then the socket is simply absent
+    SANDBOX+=(--tmpfs /tmp/.X11-unix --bind-try "/tmp/.X11-unix/X${DISP#:}" "/tmp/.X11-unix/X${DISP#:}")
+    # Programs that follow the XDG folders save downloads into the working folder
+    dirs="$STATE/user-dirs.dirs"
+    { grep -v '^XDG_DOWNLOAD_DIR=' "$HOME/.config/user-dirs.dirs" 2>/dev/null
+      printf 'XDG_DOWNLOAD_DIR="%s/Downloads"\n' "$work"; } >"$dirs"
+    SANDBOX+=(--ro-bind "$dirs" "$home/.config/user-dirs.dirs")
+}
+
+# Folders shared in the settings for reading and changing are written for real too, as the permission
+# hook lets Claude write there. Left out, so that they stay in the overlay: the home folder itself, any
+# folder containing it, and hidden folders in it, where all protected places are (startup files,
+# autostart, ~/.claude, the settings of Voice Commands). Inside the folders that are written for real,
+# Git folders and the programs of Voice Commands stay read only, as their changes could run programs.
+shared_write_args() {
+    local home="$1" settings folder real here source repo
+    settings="${XDG_CONFIG_HOME:-$HOME/.config}/voice-commands/settings.json"
+    here="$(dirname -- "$(realpath -e -- "${BASH_SOURCE[0]}" 2>/dev/null || echo /nonexistent/bin)")"
+    source="$here"
+    if [ -d "$here/../hypr" ] && [ -d "$here/../skill" ]; then source="$(dirname -- "$here")"; fi
+    while IFS= read -r folder; do
+        [[ "$folder" == /* ]] || continue
+        real="$(realpath -e -- "$folder" 2>/dev/null)" && [ -d "$real" ] || continue
+        [ "$real" != / ] || continue
+        # The home folder, or a folder that contains it
+        [[ "$home/" == "$real"/* ]] && continue
+        # A hidden folder in home, or anything below one
+        [[ "$real" == "$home"/.* ]] && continue
+        SANDBOX+=(--bind "$real" "$real")
+        while IFS= read -r -d '' repo; do
+            SANDBOX+=(--ro-bind "$repo" "$repo")
+        done < <(find "$real" -maxdepth 4 -name .git -type d -prune -print0 2>/dev/null)
+        if [[ "$source/" == "$real"/* ]]; then SANDBOX+=(--ro-bind "$source" "$source"); fi
+    done < <(jq -r '.folders // [] | .[] | select(type == "object" and (.path | type) == "string" and .write == true)
+        | .path' "$settings" 2>/dev/null)
+}
+
+# Erlaubt sind nur Programme mit Starter-Eintrag (.desktop), aber keine Terminals.
+# Sets PROGRAM to what the launcher entry starts: its absolute path if it names one, so that a file of
+# the same name earlier in PATH, such as a link in ~/.local/bin, does not run in its place.
+allowed_program() {
+    local prog never
+    # Only a name looked up in PATH, so that no file elsewhere can pass for a known program
+    [[ "$1" != */* ]] || return 1
+    prog="$1"
+    for never in "${NEVER_PROGRAMS[@]}"; do
+        [ "$prog" != "$never" ] || return 1
+    done
+    local f exec_line first
+    for f in /usr/share/applications/*.desktop "$HOME"/.local/share/applications/*.desktop; do
+        [ -f "$f" ] || continue
+        grep -qE '^Categories=.*TerminalEmulator' "$f" && continue
+        grep -qE '^Terminal=true' "$f" && continue
+        exec_line="$(grep -m1 '^Exec=' "$f")" || continue
+        exec_line="${exec_line#Exec=}"
+        # "env VAR=x prog" ueberspringen
+        for first in $exec_line; do
+            case "$first" in env|*=*) continue ;; esac
+            break
+        done
+        [ "$(basename -- "$first" 2>/dev/null)" = "$prog" ] || continue
+        if [[ "$first" == /* ]]; then
+            [ -x "$first" ] || continue
+            PROGRAM="$first"
+        else
+            PROGRAM="$(command -v -- "$prog")" || continue
+        fi
+        return 0
+    done
+    return 1
+}
+
+cmd="${1:-}"
+[ $# -gt 0 ] && shift
+
+[ "$cmd" = watch ] || touch "$STATE/activity"
+
+case "$cmd" in
+    watch)
+        watch_idle
+        ;;
+    keep)
+        case "${1:-}" in
+            ''|*[!0-9]*) echo "Usage: voice-commands-bg keep <minutes>" >&2; exit 2 ;;
+        esac
+        echo $(( $(date +%s) + $1 * 60 )) >"$STATE/keep-until"
+        echo "stays open for at least $1 minutes"
+        ;;
+    start)
+        [ $# -ge 1 ] || { echo "Usage: voice-commands-bg start <program> [arguments]" >&2; exit 2; }
+        if ! allowed_program "$1"; then
+            echo "Refused: '$1' is a path instead of a program name, has no application launcher entry, is a terminal, or can run commands (editors, IDEs, file managers)." >&2
+            exit 3
+        fi
+        # Never without the protection of the places with secrets
+        if ! command -v bwrap >/dev/null; then
+            echo "Refused: bubblewrap (bwrap) is missing, which keeps places with secrets out of sight of background programs. Install the package bubblewrap." >&2
+            exit 4
+        fi
+        if ! sandbox_args; then
+            echo "Refused: the home or working folder could not be found." >&2
+            exit 4
+        fi
+        if ! error="$(bwrap "${SANDBOX[@]}" true 2>&1)"; then
+            printf '%s\n' "$error" >>"$STATE/apps.log"
+            if [[ "$error" == *overlay* ]]; then
+                echo "Refused: the kernel module overlay is not loaded, which keeps background programs from changing files outside the working folder. Tell the user to run: sudo modprobe overlay (if it says the module is not found, the kernel was updated: restart the computer)" >&2
+            else
+                echo "Refused: bubblewrap cannot run here ($error), so the protected area for background programs is missing." >&2
+            fi
+            exit 4
+        fi
+        ensure_display
+        env -u WAYLAND_DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE \
+            GDK_BACKEND=x11 QT_QPA_PLATFORM=xcb SDL_VIDEODRIVER=x11 MOZ_ENABLE_WAYLAND=0 \
+            ELECTRON_OZONE_PLATFORM_HINT=x11 \
+            setsid nohup bwrap "${SANDBOX[@]}" -- "$PROGRAM" "${@:2}" >>"$STATE/apps.log" 2>&1 </dev/null &
+        pid=$!
+        echo "$pid" >>"$STATE/pids"
+        echo "started: $1 ($PROGRAM, pid $pid) on $DISP"
+        ;;
+    windows)
+        ensure_display
+        for w in $(xdotool search --onlyvisible --name '.*' 2>/dev/null); do
+            name="$(xdotool getwindowname "$w" 2>/dev/null)"
+            geo="$(xdotool getwindowgeometry --shell "$w" 2>/dev/null | tr '\n' ' ')"
+            echo "$w | $name | $geo"
+        done
+        ;;
+    shot)
+        ensure_display
+        out="$SHOTS/$(date +%H%M%S-%N).png"
+        import -display "$DISP" -window root "$out" && echo "$out"
+        # nur die letzten 20 Screenshots behalten
+        ls -1t "$SHOTS"/*.png 2>/dev/null | tail -n +21 | xargs -r rm -f --
+        ;;
+    click)
+        [ $# -ge 2 ] || { echo "Usage: voice-commands-bg click <x> <y> [button]" >&2; exit 2; }
+        ensure_display
+        xdotool mousemove "$1" "$2" click "${3:-1}"
+        ;;
+    focus)
+        [ $# -eq 1 ] || { echo "Usage: voice-commands-bg focus <window-id>" >&2; exit 2; }
+        ensure_display
+        xdotool windowfocus "$1"
+        ;;
+    type)
+        ensure_display
+        xdotool type --delay 20 -- "$*"
+        ;;
+    key)
+        ensure_display
+        xdotool key -- "$@"
+        ;;
+    stop)
+        stop_all
+        echo "stopped"
+        ;;
+    *)
+        echo "Usage: voice-commands-bg start|windows|shot|click|focus|type|key|keep|stop" >&2
+        exit 2
+        ;;
+esac

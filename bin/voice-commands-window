@@ -1,0 +1,2138 @@
+#!/usr/bin/python3 -I
+"""Fenster mit den letzten Antworten von Voice Commands: Text markieren oder per Knopf kopieren."""
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+# Started from a terminal, Hyprland's window swallowing would hide the terminal. It finds the terminal
+# through the parent processes, so the window continues in a grandchild that the system adopts. This
+# happens before GTK is loaded, because forking after GTK has started threads can hang.
+if os.environ.get("VOICE_COMMANDS_NO_DETACH") != "1":
+    try:
+        if os.fork() != 0:
+            os._exit(0)
+        os.setsid()
+        if os.fork() != 0:
+            os._exit(0)
+    except OSError:
+        pass
+
+import gi
+import importlib.util
+from importlib.machinery import SourceFileLoader
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
+
+# Markdown support lives next to this script, also when installed in /usr/bin
+BIN = Path(os.path.realpath(__file__)).parent
+sys.dont_write_bytecode = True
+_loader = SourceFileLoader("voice_commands_markdown", str(BIN / "voice-commands-markdown"))
+_spec = importlib.util.spec_from_loader(_loader.name, _loader)
+MARKDOWN = importlib.util.module_from_spec(_spec)
+_loader.exec_module(MARKDOWN)
+_loader = SourceFileLoader("voice_commands_theme", str(BIN / "voice-commands-theme"))
+_spec = importlib.util.spec_from_loader(_loader.name, _loader)
+THEME = importlib.util.module_from_spec(_spec)
+_loader.exec_module(THEME)
+_loader = SourceFileLoader("voice_commands_commands", str(BIN / "voice-commands-commands"))
+COMMANDS = importlib.util.module_from_spec(importlib.util.spec_from_loader(_loader.name, _loader))
+_loader.exec_module(COMMANDS)
+WORK = Path.home() / "Voice-Commands"
+HISTORY = WORK / "antworten.jsonl"
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+MODEL_FILE = CONFIG_HOME / "voice-commands" / "model"
+SETTINGS_FILE = CONFIG_HOME / "voice-commands" / "settings.json"
+HISTORY_LOCK = Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp") / "voice-commands" / "history.lock"
+SPEAK_PID = Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp") / "voice-commands" / "speak.pid"
+# voice-commands keeps the same number of entries in the history file
+MAX_ENTRIES = 50
+# The first choice uses whatever is the default in Claude Code
+MODELS = ["", "haiku", "sonnet", "opus"]
+
+
+def system_language():
+    for name in ("VOICE_COMMANDS_LANG", "LC_ALL", "LC_MESSAGES", "LANG"):
+        value = os.environ.get(name)
+        if value:
+            return value.split("_")[0].split(".")[0].split("@")[0].lower()
+    return "en"
+
+
+TEXT = {
+    "de": {"copy": "Kopieren", "copied": "Kopiert ✓", "empty": "Noch keine Antworten",
+           "empty_text": "Drücke diese Tasten, sprich deinen Befehl und drücke sie noch einmal. Claudes Antworten erscheinen dann hier.",
+           "copy_failed": "{program} fehlt",
+           "delete": "Antwort löschen",
+           "delete_tip": "Löscht die Antwort und das Gespräch aus dem Speicher von Claude Code.",
+           "deleted": "Antwort gelöscht", "deleted_all": "Gespräch gelöscht", "undo": "Rückgängig",
+           "shared_title": "Ganzes Gespräch löschen?",
+           "shared_body": "Diese Antwort gehört zu einem fortgesetzten Gespräch. Claude Code speichert das Gespräch nur als Ganzes, deshalb lassen sich diese {n} Antworten nur gemeinsam aus seinem Speicher löschen.",
+           "shared_more": "Ganze Antwort und {k} weitere anzeigen", "shared_more_one": "Ganze Antwort und 1 weitere anzeigen",
+           "shared_less": "Weniger anzeigen", "fold_more": "Ganze Antwort anzeigen", "fold_less": "Weniger anzeigen",
+           "shared_hint": "„Nur aus der Übersicht löschen“ entfernt nur diese eine Antwort aus diesem Fenster. In der Aufzeichnung von Claude Code bleibt sie trotzdem erhalten, bis das Gespräch nach der Frist unter Datenschutz in den Einstellungen gelöscht wird.",
+           "shared_this": "diese Antwort",
+           "shared_all": "Ganzes Gespräch löschen", "shared_one": "Nur aus der Übersicht löschen", "model": "Modell:", "model_default": "Claude-Code-Standard",
+           "model_tip": "Modell für Sprachbefehle. Normale Claude-Code-Sitzungen bleiben unverändert.",
+           "desktop": "In Claude Desktop weiterführen", "desktop_opening": "Wird geöffnet …",
+           "desktop_missing": "Claude Desktop nicht gefunden",
+           "desktop_tip": "Öffnet diese Sitzung in der Claude-Desktop-App. Dort gelten nicht die engen Rechte der Sprachbefehle.",
+           "pending_text": "Änderungen gelten erst, wenn du sie übernimmst.", "pending_apply": "Übernehmen",
+           "pending_discard": "Verwerfen", "pending_back": "Zurück", "pending_done": "Änderungen übernommen.",
+           "pending_title": "Änderungen übernehmen?", "pending_body": "Du hast Einstellungen geändert, aber noch nicht übernommen. Verworfene Änderungen gelten nicht.",
+           "settings": "Einstellungen", "read": "Vorlesen", "stop": "Stopp",
+           "work_folder": "Arbeitsordner öffnen", "work_folder_tip": "Öffnet ~/Voice-Commands, wo Claude seine Dateien speichert",
+           "file_tip": "{path}\nKlicken zum Öffnen, Rechtsklick zeigt sie im Ordner",
+           "file_tip_folder": "{path}\nKlicken zeigt sie im Ordner: Programme und Skripte werden zur Sicherheit nicht direkt geöffnet",
+           "file_missing": "{path}\nNicht mehr vorhanden", "open_failed": "Konnte nicht geöffnet werden",
+           "help": "Hilfe", "welcome": "Willkommen", "open_help": "Hilfe öffnen", "start": "Los geht’s",
+           "read_missing": "Keine Stimme eingerichtet. Siehe Einstellungen.",
+           "look": "Darstellung", "appearance": "Erscheinungsbild",
+           "appearance_sub": "Gilt für dieses Fenster, die Erlaubnis-Fenster und die Statusleiste.",
+           "appearance_options": ["Wie das System", "Hell", "Dunkel"],
+           "speech": "Vorlesen", "speak": "Antworten vorlesen",
+           "speak_sub": "Liest Claudes Antworten laut vor. {cancel} beendet das Vorlesen.",
+           "scope": "Was vorgelesen wird", "scope_options": ["Nur den ersten Absatz", "Die ganze Antwort"],
+           "rate": "Sprechtempo", "rate_options": ["Langsam", "Normal", "Schnell"],
+           "voice": "Stimme", "try": "Probe anhören", "sample": "Hallo! So klingt die Stimme für deine Sprachbefehle.",
+           "voice_piper": "Natürlichere Stimme mit Piper",
+           "voice_system": "Systemstimme. Für eine natürlichere Stimme installiere piper-tts aus dem AUR oder mit pipx install piper-tts und führe danach voice-commands-setup aus.",
+           "voice_none": "Keine funktionierende Stimme gefunden. Installiere piper-tts aus dem AUR und führe danach voice-commands-setup aus.",
+           "commands": "Sprachbefehle", "language": "Gesprochene Sprache",
+           "language_sub": "Hilft der Spracherkennung, dich richtig zu verstehen.",
+           "language_options": ["Systemsprache", "Deutsch", "Englisch", "Automatisch erkennen"],
+           "followup": "Gespräch automatisch fortsetzen",
+           "followup_sub": "Ein Befehl innerhalb dieser Zeit nach dem letzten setzt dessen Gespräch fort, Claude kennt dann den Zusammenhang. Danach beginnt ein neues Gespräch. Mit „mach weiter“ geht es immer.",
+           "followup_options": ["Aus, nur mit „mach weiter“", "5 Minuten", "15 Minuten", "30 Minuten"],
+           "countdown": "Bedenkzeit vor dem Start",
+           "countdown_sub": "Zeit, um einen falsch verstandenen Befehl mit {cancel} abzubrechen. Mit {send} startet er sofort.",
+           "seconds": "{n} s", "countdown_off": "Aus, sofort starten",
+           "window": "Antwortfenster", "open_window": "Öffnen, wenn Claude fertig ist",
+           "open_window_sub": "Zeigt jede Antwort sofort hier an, zusätzlich zur Benachrichtigung.",
+           "commands_title": "Befehle ohne Rückfrage",
+           "commands_sub": "Diese Befehle laufen ohne Ja-Nein-Abfrage, aber nur als einfacher Aufruf: ohne Verkettung, Umleitung oder eingebettete Befehle. Alles andere fragt weiter.",
+           "commands_info": "Systeminfos", "commands_info_sub": "Lesen nur den Zustand des Systems, keine Dateien.",
+           "commands_files": "Lesende Dateibefehle", "commands_files_sub": "Nur lesend. Wie weit jeder Befehl ohne Abfrage reicht, wählst du daneben; der Arbeitsordner ist immer dabei.",
+           "scope_names": ["Nur Arbeitsordner", "+ freigegebene Ordner", "+ persönliche Ordner", "Home ohne versteckte Ordner", "+ Systemdateien", "Systemweit", "+ eigene Ordner"],
+           "scope_folders": "Ordner für {name}", "scope_folders_sub": "Hier läuft {name} ohne Abfrage, zusätzlich zum Arbeitsordner. Bekannte Orte mit Passwörtern oder Schlüsseln fragen trotzdem.", "scope_folders_button": "Ordner wählen",
+           "scope_wide_title": "So weit ohne Abfrage?",
+           "scope_wide_body": "{name} darf dann ohne Abfrage {where} lesen. Was Claude liest, geht an Anthropic, und versteckte Anweisungen in Webseiten könnten Claude private Dateien lesen lassen.\n\nWichtig: Passwörter und Schlüssel erkennt Voice Commands nur an bekannten Namen wie ~/.ssh oder .env. Andere Zugangsdaten, {missed}, liest Claude dann ohne Abfrage.",
+           "scope_missed_home": "etwa in einer eigenen Notiz",
+           "scope_missed_system": "etwa Zugänge zu Netzlaufwerken in /etc/fstab oder Einstellungen unter /etc und /opt, die alle lesen dürfen",
+           "scope_missed_everywhere": "etwa in Programmeinstellungen, unter /etc oder in einer eigenen Notiz",
+           "scope_wide_home": "deinen ganzen Home-Ordner außer versteckten Ordnern",
+           "scope_wide_system": "Systemdateien in /\u2060etc, /\u2060usr, /\u2060opt, /\u2060sys und /\u2060proc", "scope_wide_everywhere": "überall auf dem Rechner",
+           "commands_folder_add": "Ordner hinzufügen …", "commands_folder_remove": "Ordner entfernen",
+           "commands_own": "Eigene Befehle", "commands_own_sub": "Ein Befehl und, wenn du willst, der Anfang seiner Argumente. Alles, was mit diesen Wörtern beginnt, läuft ohne Abfrage, bei Befehlen mit Auswahlmenü nur in der gewählten Reichweite.",
+           "commands_add": "Befehl hinzufügen", "commands_remove": "Befehl entfernen",
+           "commands_tips": "Eigene Befehle auf eigene Gefahr",
+           "commands_tips_body": "Eigene Befehle fügst du auf eigene Gefahr hinzu. Ein freigegebener Befehl läuft ohne Abfrage, auch mit allen Argumenten, die Claude dahinter schreibt. Prüfe deshalb selbst, was der Befehl alles kann.\n• Je nach Argumenten kann ein Befehl Dateien ändern oder löschen, Programme installieren, Daten verschicken oder andere Befehle starten.\n• Manche Programme lesen Einstellungen oder Skripte aus dem Ordner, in dem sie laufen, und führen sie aus. Claude kann in seinem Arbeitsordner solche Dateien anlegen.\n• Alles, was ein Befehl ausgibt, wird an Anthropic gesendet.\n• Webseiten und Dateien können versteckte Anweisungen enthalten, die Claude dazu bringen, einen freigegebenen Befehl anders zu nutzen als gedacht.\n• Nur bekannte lesende Befehle wie rg, fd, diff oder sort lassen sich in ihrer Reichweite beschränken; sie bekommen dafür ein Auswahlmenü. Alle anderen eigenen Befehle dürfen jeden Ort lesen, den Claude ihnen nennt.\n• Gib Befehle so genau wie möglich an und schalte sie aus, wenn du sie nicht brauchst.\n• Bekannte Orte mit Passwörtern oder Schlüsseln wie ~/.ssh oder .env fragen trotzdem. Andere Zugangsdaten, etwa in einer eigenen Notiz, erkennt Voice Commands nicht.\n• Manche Programme zeigen Zugangsdaten, ohne einen Ort zu nennen, etwa printenv, ps, journalctl, gpg oder gh. Dann greift dieser Schutz gar nicht.\n• sudo, Shells und Programme wie python oder env lassen sich nicht freigeben, weil sie jeden beliebigen Befehl ausführen.",
+           "commands_add_title": "Ohne Rückfrage erlauben?",
+           "commands_add_body": "„{command}“ läuft dann ohne Abfrage, auch mit allen Argumenten, die Claude dahinter setzt. Das geschieht auf deine eigene Gefahr. Bekannte Orte mit Passwörtern oder Schlüsseln fragen trotzdem.",
+           "commands_add_body_scoped": "„{command}“ läuft dann ohne Abfrage, auch mit allen Argumenten, die Claude dahinter setzt, aber nur in der Reichweite, die du im Auswahlmenü neben ihm einstellst. Zunächst ist das nur der Arbeitsordner. Optionen, mit denen {name} etwas ausführen oder schreiben könnte, fragen immer, ebenso bekannte Orte mit Passwörtern oder Schlüsseln. Das geschieht auf deine eigene Gefahr.",
+           "risk_project": "Achtung: Dieses Programm führt Befehle oder Einstellungen aus Projektdateien im aktuellen Ordner aus. Claude kann solche Dateien in seinem Arbeitsordner anlegen.",
+           "risk_change": "Achtung: Dieses Programm kann Dateien oder das System ändern oder löschen.",
+           "risk_network": "Achtung: Dieses Programm verbindet sich mit anderen Rechnern und kann Daten verschicken.",
+           "risk_starts": "Achtung: Dieses Programm kann andere Programme oder Befehle starten.",
+           "risk_secrets": "Achtung: Dieses Programm kann Zugangsdaten anzeigen, ohne eine Datei zu nennen, etwa Tokens, Schlüssel oder Umgebungsvariablen. Der Schutz für Orte mit Passwörtern oder Schlüsseln greift dann nicht.",
+           "commands_add_ok": "Erlauben",
+           "commands_problem_plain": "Nur ein einfacher Befehl geht, ohne ; | & > $ ( ) {{ }} und ohne Platzhalter wie *.",
+           "commands_problem_name": "Bitte nur den Namen des Befehls, ohne Pfad und ohne Variablen.",
+           "commands_problem_never": "„{name}“ führt jeden beliebigen Befehl aus. Ihn freizugeben würde die Abfrage ganz abschalten, deshalb geht das nicht.",
+           "commands_problem_twice": "Diesen Befehl gibt es schon.",
+           "commands_problem_builtin_file": "„{name}“ ist schon eingebaut. Wie weit er ohne Abfrage reicht, stellst du oben im Auswahlmenü neben ihm ein.",
+           "commands_problem_builtin_info": "„{name}“ ist schon eingebaut und läuft ohne Abfrage, solange er oben eingeschaltet ist.",
+           "folders": "Freigegebene Ordner",
+           "folders_sub": "Hier darf Claude ohne Rückfrage lesen, bei „Lesen und ändern“ auch Dateien anlegen und ändern. Gelesene Inhalte werden an Anthropic gesendet. Befehle, bekannte Orte mit Passwörtern oder Schlüsseln und Dateien, die Programme starten, fragen trotzdem.",
+           "folder_add": "Ordner hinzufügen …", "folder_remove": "Freigabe entfernen",
+           "folder_access": ["Nur lesen", "Lesen und ändern"],
+           "folder_root": "Den ganzen Rechner kannst du nicht freigeben.",
+           "folder_wide_title": "So viel freigeben?",
+           "folder_wide_body": "„{path}“ enthält viele Dateien, auch Einstellungen und private Daten. Claude könnte sie ohne Rückfrage lesen und an Anthropic senden. Gib besser nur die Ordner frei, die Claude wirklich braucht.",
+           "folder_wide_ok": "Trotzdem freigeben",
+           "folder_hidden_title": "Einstellungsordner freigeben?",
+           "folder_hidden_body": "In „{path}“ speichern Programme ihre Einstellungen, oft auch Anmeldungen, Verläufe oder Schlüssel. Claude könnte das ohne Rückfrage lesen und an Anthropic senden. Gib so einen Ordner nur frei, wenn du genau weißt, was darin liegt.",
+           "folder_write_title": "Auch ändern erlauben?",
+           "folder_write_body": "Claude darf dann in „{path}“ ohne Rückfrage Dateien anlegen und überschreiben. Ein falsch verstandener Befehl oder manipulierte Inhalte einer Webseite können so Dateien beschädigen, und das lässt sich oft nicht rückgängig machen.\n\nWähle das nur für Ordner, von denen du eine Sicherung hast oder deren Inhalt du leicht wiederherstellen kannst, zum Beispiel ein Git-Projekt.",
+           "folder_write_ok": "Ändern erlauben",
+           "folder_tips": "Worauf du achten solltest",
+           "folder_tips_body": "• Gib nur die Ordner frei, die Claude wirklich braucht. Je kleiner, desto besser: lieber „~/Dokumente/Steuer“ als „~/Dokumente“.\n• Alles, was Claude liest, wird an Anthropic gesendet. Gib keine Ordner mit privaten Fotos, Ausweisen, Verträgen, Gesundheits- oder Bankdaten frei.\n• Passwörter und Schlüssel erkennt Voice Commands nur an bekannten Namen wie ~/.ssh oder .env. Andere Zugangsdaten, etwa in einer eigenen Notiz, liest Claude in freigegebenen Ordnern ohne Rückfrage.\n• Meide Einstellungsordner wie ~/.config oder ~/.local. Dort liegen oft Anmeldungen, Verläufe und Schlüssel.\n• Wähle „Lesen und ändern“ nur, wenn Claude dort wirklich schreiben soll und du eine Sicherung hast. Fehler lassen sich oft nicht rückgängig machen.\n• Sei vorsichtig mit Ordnern, die mit einer Cloud oder anderen Geräten synchronisiert werden: Änderungen landen dann auch dort.\n• Webseiten und Dateien können versteckte Anweisungen enthalten. In freigegebenen Ordnern fragt dich dann niemand mehr.\n• Entferne Freigaben, die du nicht mehr brauchst.",
+           "privacy": "Datenschutz", "keep": "Gespräche aufbewahren",
+           "keep_sub": "Claude Code speichert jedes Gespräch mit allem, was Claude gelesen hat, auch Bildschirmfotos. Danach werden sie gelöscht und lassen sich nicht mehr fortsetzen.",
+           "keep_options": ["1 Tag", "7 Tage", "30 Tage"],
+           "clear": "Verlauf löschen", "clear_title": "Verlauf löschen?",
+           "clear_body": "Alle Antworten in diesem Fenster und alle Gespräche der Sprachbefehle im Speicher von Claude Code werden gelöscht. Danach lässt sich kein Gespräch mehr fortsetzen. Dateien, die Claude in ~/Voice-Commands gespeichert hat, bleiben erhalten. Das lässt sich nicht rückgängig machen.",
+           "cancel": "Abbrechen",
+           "shortcuts": "Tastenkürzel",
+           "shortcuts_classic": "Braucht Hyprlands Lua-Einstellungen (hyprland.lua, ab Hyprland 0.55). Die klassische hyprland.conf wird nicht unterstützt, auch nicht mit neueren Versionen.",
+           "shortcuts_press": "Mit „Ändern“ drückst du die neue Tastenkombination einfach.",
+           "change": "Ändern", "press_title": "Neue Tastenkombination",
+           "press": "Drücke jetzt die neue Tastenkombination für „{action}“.",
+           "press_hint": "Escape bricht ab. Solange sind die Hyprland-Tastenkürzel aus, höchstens 20 Sekunden.",
+           "press_failed": "Die Tasten konnten nicht abgefragt werden. Schreib das Kürzel stattdessen.",
+           "press_hint_kde": "Escape bricht ab. Solange sind die Plasma-Tastenkurzbefehle aus, höchstens 20 Sekunden.",
+           "press_hint_gnome": "Escape bricht ab. Damit jede Taste ankommt, schaltet GNOME seine Tastenkürzel solange aus. Beim ersten Mal fragt GNOME, ob es das darf.",
+           "shortcuts_other": "Nur unter Hyprland, KDE Plasma und GNOME. Auf anderen Desktops legst du die Kürzel in deinen Tastatureinstellungen fest.",
+           "shortcut_toggle": "Aufnahme starten oder beenden", "shortcut_cancel": "Abbrechen",
+           "shortcut_window": "Antwortfenster öffnen", "shortcut_send": "Erkannten Befehl sofort senden",
+           "shortcut_type": "Befehl eintippen", "shortcut_reset": "Standard wiederherstellen",
+           "shortcut_invalid": "„{combo}“ ist kein gültiges Tastenkürzel.",
+           "shortcut_twice": "{combo} ist schon für eine andere Aktion von Voice Commands eingestellt.",
+           "shortcut_saved": "Tastenkürzel übernommen.",
+           "classic": "sie brauchen Hyprlands Lua-Einstellungen (hyprland.lua), die klassische hyprland.conf wird nicht unterstützt",
+           "missing": "{combo} funktioniert nicht", "conflict": "{combo} ist auch anderweitig belegt",
+           "banner": "Tastenkürzel: {problems}.", "banner_button": "Einstellungen",
+           "used_title": "Taste schon belegt",
+           "used_body": "{combo} ist in Hyprland schon belegt: {uses}.\n\nMach die Taste zuerst in deinen Hyprland-Einstellungen in ~/.config/hypr frei und übernimm das Kürzel dann noch einmal. Oder wähle eine andere Taste.",
+           "used_reset": "Diese Standardkürzel sind in Hyprland schon belegt und wurden nicht übernommen:\n\n{list}\n\nMach die Tasten zuerst in deinen Hyprland-Einstellungen in ~/.config/hypr frei und stelle den Standard dann noch einmal wieder her.",
+           "used_body_kde": "{combo} ist in Plasma schon belegt: {uses}.\n\nMach die Taste zuerst in den Systemeinstellungen unter Tastatur → Tastenkurzbefehle frei und übernimm das Kürzel dann noch einmal. Oder wähle eine andere Taste.",
+           "used_reset_kde": "Diese Standardkürzel sind in Plasma schon belegt und wurden nicht übernommen:\n\n{list}\n\nMach die Tasten zuerst in den Systemeinstellungen unter Tastatur → Tastenkurzbefehle frei und stelle den Standard dann noch einmal wieder her.",
+           "used_body_gnome": "{combo} ist in GNOME schon belegt: {uses}.\n\nMach die Taste zuerst in den Einstellungen unter Tastatur → Tastenkürzel ansehen und anpassen frei und übernimm das Kürzel dann noch einmal. Oder wähle eine andere Taste.",
+           "used_reset_gnome": "Diese Standardkürzel sind in GNOME schon belegt und wurden nicht übernommen:\n\n{list}\n\nMach die Tasten zuerst in den Einstellungen unter Tastatur → Tastenkürzel ansehen und anpassen frei und stelle den Standard dann noch einmal wieder her.",
+           "shortcut_unusable": "{combo} kann dein Desktop nicht als Tastenkürzel verwenden. Wähle eine andere Taste.",
+           "ok": "OK",
+           "uses": {"close": "Fenster schließen", "killactive": "Fenster schließen", "fullscreen": "Vollbild",
+                    "focus": "Fokus oder Arbeitsfläche wechseln", "workspace": "Arbeitsfläche wechseln",
+                    "exec_cmd": "startet ein Programm oder einen Befehl", "exec": "startet ein Programm oder einen Befehl",
+                    "layout": "Fensteranordnung", "drag": "Fenster verschieben", "resize": "Fenstergröße ändern",
+                    "toggle_special": "Spezial-Arbeitsfläche", "window": "Fensteraktion", "exit": "Hyprland beenden",
+                    "function": "eine eigene Funktion in deinen Einstellungen"}},
+    "en": {"copy": "Copy", "copied": "Copied ✓", "empty": "No responses yet",
+           "empty_text": "Press these keys, speak your command and press them again. Claude's responses then appear here.",
+           "copy_failed": "{program} is missing",
+           "delete": "Delete response",
+           "delete_tip": "Deletes the response and its conversation from Claude Code's storage.",
+           "deleted": "Response deleted", "deleted_all": "Conversation deleted", "undo": "Undo",
+           "shared_title": "Delete the whole conversation?",
+           "shared_body": "This response belongs to a continued conversation. Claude Code stores the conversation only as a whole, so these {n} responses can only be deleted from its storage together.",
+           "shared_more": "Show the whole response and {k} more", "shared_more_one": "Show the whole response and 1 more",
+           "shared_less": "Show less", "fold_more": "Show the whole response", "fold_less": "Show less",
+           "shared_hint": "\"Only remove from the overview\" removes just this one response from this window. Claude Code's record still keeps it until the conversation is deleted after the time set under Privacy in the settings.",
+           "shared_this": "this response",
+           "shared_all": "Delete the whole conversation", "shared_one": "Only remove from the overview", "model": "Model:", "model_default": "Claude Code default",
+           "model_tip": "Model for voice commands. Regular Claude Code sessions stay unchanged.",
+           "desktop": "Continue in Claude Desktop", "desktop_opening": "Opening …",
+           "desktop_missing": "Claude Desktop not found",
+           "desktop_tip": "Opens this session in the Claude desktop app. The narrow permissions of voice commands do not apply there.",
+           "pending_text": "Changes only take effect when you apply them.", "pending_apply": "Apply",
+           "pending_discard": "Discard", "pending_back": "Back", "pending_done": "Changes applied.",
+           "pending_title": "Apply changes?", "pending_body": "You changed settings but have not applied them yet. Discarded changes do not take effect.",
+           "settings": "Settings", "read": "Read aloud", "stop": "Stop",
+           "work_folder": "Open working folder", "work_folder_tip": "Opens ~/Voice-Commands, where Claude saves its files",
+           "file_tip": "{path}\nClick to open, right-click to show it in its folder",
+           "file_tip_folder": "{path}\nClick to show it in its folder: programs and scripts are not opened directly, for safety",
+           "file_missing": "{path}\nNo longer there", "open_failed": "Could not be opened",
+           "help": "Help", "welcome": "Welcome", "open_help": "Open help", "start": "Get started",
+           "read_missing": "No voice set up. See the settings.",
+           "look": "Appearance", "appearance": "Color scheme",
+           "appearance_sub": "Applies to this window, the permission windows and the status bar.",
+           "appearance_options": ["Follow the system", "Light", "Dark"],
+           "speech": "Reading aloud", "speak": "Read responses aloud",
+           "speak_sub": "Reads Claude's responses aloud. {cancel} stops reading.",
+           "scope": "What is read", "scope_options": ["Only the first paragraph", "The whole response"],
+           "rate": "Speed", "rate_options": ["Slow", "Normal", "Fast"],
+           "voice": "Voice", "try": "Listen to a sample", "sample": "Hello! This is how the voice for your voice commands sounds.",
+           "voice_piper": "More natural voice with Piper",
+           "voice_system": "System voice. For a more natural voice, install piper-tts from the AUR or with pipx install piper-tts, then run voice-commands-setup.",
+           "voice_none": "No working voice found. Install piper-tts from the AUR and then run voice-commands-setup.",
+           "commands": "Voice commands", "language": "Spoken language",
+           "language_sub": "Helps speech recognition understand you correctly.",
+           "language_options": ["System language", "German", "English", "Detect automatically"],
+           "followup": "Continue the conversation automatically",
+           "followup_sub": "A command within this time after the last one continues its conversation, so Claude knows the context. After that, a new conversation starts. Saying \"continue\" always works.",
+           "followup_options": ["Off, only with \"continue\"", "5 minutes", "15 minutes", "30 minutes"],
+           "countdown": "Time before starting",
+           "countdown_sub": "Time to cancel a misheard command with {cancel}. {send} starts it right away.",
+           "seconds": "{n} s", "countdown_off": "Off, start right away",
+           "window": "Response window", "open_window": "Open when Claude is done",
+           "open_window_sub": "Shows every response here right away, in addition to the notification.",
+           "commands_title": "Commands without asking",
+           "commands_sub": "These commands run without a yes or no dialog, but only as a plain call: no chaining, redirection or embedded commands. Everything else still asks.",
+           "commands_info": "System information", "commands_info_sub": "Only read the state of the system, no files.",
+           "commands_files": "Reading file commands", "commands_files_sub": "Reading only. Choose beside each command how far it reaches without a dialog; the working folder is always included.",
+           "scope_names": ["Working folder only", "+ shared folders", "+ personal folders", "Home without hidden folders", "+ system files", "Everywhere", "+ own folders"],
+           "scope_folders": "Folders for {name}", "scope_folders_sub": "{name} runs without a dialog here, besides the working folder. Known places with passwords or keys still ask.", "scope_folders_button": "Choose folders",
+           "scope_wide_title": "This far without asking?",
+           "scope_wide_body": "{name} may then read {where} without a dialog. What Claude reads goes to Anthropic, and hidden instructions in websites could make Claude read private files.\n\nImportant: Voice Commands recognizes passwords and keys only by known names such as ~/.ssh or .env. Claude then reads other access data, {missed}, without a dialog.",
+           "scope_missed_home": "for example in a note of your own",
+           "scope_missed_system": "for example logins for network drives in /etc/fstab or settings under /etc and /opt that everyone may read",
+           "scope_missed_everywhere": "for example in program settings, under /etc or in a note of your own",
+           "scope_wide_home": "your whole home folder except hidden folders",
+           "scope_wide_system": "system files in /\u2060etc, /\u2060usr, /\u2060opt, /\u2060sys and /\u2060proc", "scope_wide_everywhere": "everywhere on the computer",
+           "commands_folder_add": "Add folder …", "commands_folder_remove": "Remove folder",
+           "commands_own": "Own commands", "commands_own_sub": "A command and, if you like, the start of its arguments. Everything that starts with these words runs without a dialog, for commands with a drop-down only within the chosen reach.",
+           "commands_add": "Add command", "commands_remove": "Remove command",
+           "commands_tips": "Own commands at your own risk",
+           "commands_tips_body": "You add own commands at your own risk. An allowed command runs without a dialog, also with any arguments Claude writes after it. So check yourself what the command can do.\n• Depending on its arguments, a command can change or delete files, install programs, send data or start other commands.\n• Some programs read settings or scripts from the folder they run in and carry them out. Claude can create such files in its working folder.\n• Everything a command prints is sent to Anthropic.\n• Websites and files can contain hidden instructions that make Claude use an allowed command differently than intended.\n• Only known reading commands such as rg, fd, diff or sort can be limited in their reach; they get a drop-down for it. All other own commands may read any place Claude names to them.\n• Be as exact as possible and switch commands off when you do not need them.\n• Known places with passwords or keys such as ~/.ssh or .env still ask. Voice Commands does not recognize other access data, for example in a note of your own.\n• Some programs show access data without naming a place, such as printenv, ps, journalctl, gpg or gh. This protection does not apply to them at all.\n• sudo, shells and programs such as python or env cannot be allowed, because they run any command.",
+           "commands_add_title": "Allow without asking?",
+           "commands_add_body": "\"{command}\" then runs without a dialog, also with any arguments Claude adds. This is at your own risk. Known places with passwords or keys still ask.",
+           "commands_add_body_scoped": "\"{command}\" then runs without a dialog, also with any arguments Claude adds, but only within the reach you choose in the drop-down beside it. At first that is only the working folder. Options with which {name} could run or write something always ask, and so do known places with passwords or keys. This is at your own risk.",
+           "risk_project": "Caution: this program runs commands or settings from project files in the current folder. Claude can create such files in its working folder.",
+           "risk_change": "Caution: this program can change or delete files or the system.",
+           "risk_network": "Caution: this program connects to other computers and can send data.",
+           "risk_starts": "Caution: this program can start other programs or commands.",
+           "risk_secrets": "Caution: this program can show access data without naming a file, such as tokens, keys or environment variables. The protection for places with passwords or keys does not apply then.",
+           "commands_add_ok": "Allow",
+           "commands_problem_plain": "Only a plain command works, without ; | & > $ ( ) {{ }} and without wildcards such as *.",
+           "commands_problem_name": "Please give only the name of the command, without a path or variables.",
+           "commands_problem_never": "\"{name}\" runs any command. Allowing it would turn the dialog off entirely, so it cannot be allowed.",
+           "commands_problem_twice": "This command is already there.",
+           "commands_problem_builtin_file": "\"{name}\" is already built in. Choose how far it reaches without a dialog in the drop-down beside it above.",
+           "commands_problem_builtin_info": "\"{name}\" is already built in and runs without a dialog as long as it is switched on above.",
+           "folders": "Shared folders",
+           "folders_sub": "Claude may read here without asking, and with \"Read and change\" also create and change files. What Claude reads is sent to Anthropic. Commands, known places with passwords or keys, and files that start programs still ask.",
+           "folder_add": "Add folder …", "folder_remove": "Stop sharing",
+           "folder_access": ["Read only", "Read and change"],
+           "folder_root": "You cannot share the whole computer.",
+           "folder_wide_title": "Share this much?",
+           "folder_wide_body": "\"{path}\" holds many files, including settings and private data. Claude could read them without asking and send them to Anthropic. Better share only the folders Claude really needs.",
+           "folder_wide_ok": "Share anyway",
+           "folder_hidden_title": "Share a settings folder?",
+           "folder_hidden_body": "Programs keep their settings in \"{path}\", often also logins, histories or keys. Claude could read them without asking and send them to Anthropic. Share a folder like this only if you know exactly what is in it.",
+           "folder_write_title": "Allow changes as well?",
+           "folder_write_body": "Claude may then create and overwrite files in \"{path}\" without asking. A misheard command or manipulated website content could damage files this way, and that often cannot be undone.\n\nChoose this only for folders you have a backup of or whose content you can easily restore, such as a Git project.",
+           "folder_write_ok": "Allow changes",
+           "folder_tips": "What to watch out for",
+           "folder_tips_body": "• Share only the folders Claude really needs. The smaller, the better: rather \"~/Documents/Taxes\" than \"~/Documents\".\n• Everything Claude reads is sent to Anthropic. Do not share folders with private photos, ID documents, contracts, health or bank data.\n• Voice Commands recognizes passwords and keys only by known names such as ~/.ssh or .env. Claude reads other access data in shared folders without a dialog, for example in a note of your own.\n• Avoid settings folders such as ~/.config or ~/.local. They often hold logins, histories and keys.\n• Choose \"Read and change\" only if Claude really needs to write there and you have a backup. Mistakes often cannot be undone.\n• Be careful with folders that sync to a cloud or other devices: changes end up there as well.\n• Websites and files can contain hidden instructions. In shared folders, nobody asks you anymore.\n• Remove shares you no longer need.",
+           "privacy": "Privacy", "keep": "Keep conversations",
+           "keep_sub": "Claude Code saves each conversation with everything Claude read, including screenshots. Afterwards they are deleted and can no longer be continued.",
+           "keep_options": ["1 day", "7 days", "30 days"],
+           "clear": "Clear history", "clear_title": "Clear history?",
+           "clear_body": "All responses in this window and all conversations of voice commands in Claude Code's storage will be deleted. No conversation can be continued afterwards. Files Claude saved in ~/Voice-Commands are kept. This cannot be undone.",
+           "cancel": "Cancel",
+           "shortcuts": "Keyboard shortcuts",
+           "shortcuts_classic": "Needs Hyprland's Lua settings (hyprland.lua, Hyprland 0.55 or newer). The classic hyprland.conf is not supported, not even with newer versions.",
+           "shortcuts_press": "With \"Change\", you simply press the new key combination.",
+           "change": "Change", "press_title": "New key combination",
+           "press": "Now press the new key combination for \"{action}\".",
+           "press_hint": "Escape cancels. Meanwhile, Hyprland's keyboard shortcuts are off, for 20 seconds at most.",
+           "press_failed": "The keys could not be read. Write the shortcut instead.",
+           "press_hint_kde": "Escape cancels. Meanwhile, Plasma's keyboard shortcuts are off, for 20 seconds at most.",
+           "press_hint_gnome": "Escape cancels. So that every key arrives, GNOME turns its shortcuts off meanwhile. The first time, GNOME asks whether it may.",
+           "shortcuts_other": "Only on Hyprland, KDE Plasma and GNOME. On other desktops, set the shortcuts in your keyboard settings.",
+           "shortcut_toggle": "Start or stop recording", "shortcut_cancel": "Cancel",
+           "shortcut_window": "Open the response window", "shortcut_send": "Send the recognized command now",
+           "shortcut_type": "Type a command", "shortcut_reset": "Restore defaults",
+           "shortcut_invalid": "\"{combo}\" is not a valid shortcut.",
+           "shortcut_twice": "{combo} is already set for another action of Voice Commands.",
+           "shortcut_saved": "Shortcut applied.",
+           "classic": "they need Hyprland's Lua settings (hyprland.lua), the classic hyprland.conf is not supported",
+           "missing": "{combo} does not work", "conflict": "{combo} is also used for something else",
+           "banner": "Keyboard shortcuts: {problems}.", "banner_button": "Settings",
+           "used_title": "Key already in use",
+           "used_body": "{combo} is already used in Hyprland: {uses}.\n\nFirst free the key in your Hyprland settings in ~/.config/hypr, then apply the shortcut again. Or choose another key.",
+           "used_reset": "These default shortcuts are already used in Hyprland and were not applied:\n\n{list}\n\nFirst free the keys in your Hyprland settings in ~/.config/hypr, then restore the defaults again.",
+           "used_body_kde": "{combo} is already used in Plasma: {uses}.\n\nFirst free the key in the system settings under Keyboard → Shortcuts, then apply the shortcut again. Or choose another key.",
+           "used_reset_kde": "These default shortcuts are already used in Plasma and were not applied:\n\n{list}\n\nFirst free the keys in the system settings under Keyboard → Shortcuts, then restore the defaults again.",
+           "used_body_gnome": "{combo} is already used in GNOME: {uses}.\n\nFirst free the key in the settings under Keyboard → View and Customize Shortcuts, then apply the shortcut again. Or choose another key.",
+           "used_reset_gnome": "These default shortcuts are already used in GNOME and were not applied:\n\n{list}\n\nFirst free the keys in the settings under Keyboard → View and Customize Shortcuts, then restore the defaults again.",
+           "shortcut_unusable": "Your desktop cannot use {combo} as a shortcut. Choose another key.",
+           "ok": "OK",
+           "uses": {"close": "close window", "killactive": "close window", "fullscreen": "fullscreen",
+                    "focus": "change focus or workspace", "workspace": "change workspace",
+                    "exec_cmd": "starts a program or command", "exec": "starts a program or command",
+                    "layout": "window layout", "drag": "move window", "resize": "resize window",
+                    "toggle_special": "special workspace", "window": "window action", "exit": "quit Hyprland",
+                    "function": "a function of your own in your settings"}},
+}
+LABELS = TEXT.get(system_language(), TEXT["en"])
+
+
+def load_model():
+    try:
+        value = MODEL_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    return value if value in MODELS else ""
+
+
+def save_model(model):
+    MODEL_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = MODEL_FILE.with_suffix(".tmp")
+    temporary.write_text(model + "\n" if model else "", encoding="utf-8")
+    temporary.replace(MODEL_FILE)
+
+
+def model_picker():
+    names = [LABELS["model_default"], "Haiku", "Sonnet", "Opus"]
+    picker = Gtk.DropDown.new_from_strings(names)
+    picker.set_tooltip_text(LABELS["model_tip"])
+    picker.set_selected(MODELS.index(load_model()))
+    picker.connect("notify::selected", lambda widget, _param: save_model(MODELS[widget.get_selected()]))
+    return picker
+
+
+DEFAULTS = {"shortcuts": {}, "shortcuts_kde": {}, "shortcuts_gnome": {}, "speak": False, "speak_scope": "first", "speak_rate": "normal",
+            "recognition_language": "system", "countdown": 5, "open_window": False, "keep_sessions": 7, "followup": 5,
+            "folders": [], "appearance": "system", "commands_off": [], "own_commands": [], "file_command_scopes": {}, "file_command_custom": {}}
+SCOPES = ["first", "all"]
+RATES = ["slow", "normal", "fast"]
+LANGUAGES = ["system", "de", "en", "auto"]
+COUNTDOWNS = [0, 3, 5, 10]
+KEEP_DAYS = [1, 7, 30]
+FOLLOWUPS = [0, 5, 15, 30]
+# Responses fold to this many visible lines in the overview; shorter texts are never folded
+FOLD_LINES = 3
+FOLD_MIN_CHARS = 100
+# Claude Code's folder for the conversations of voice commands
+SESSIONS = Path.home() / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(Path.home() / "Voice-Commands"))
+
+
+# While the settings are open, changes wait here until the user applies them (asked for by the user on
+# 2026-11-03), so that nothing changes by a slip. The dialog already shows them; the file and everything
+# reading it, such as voice commands and the permission hook, only get them when applied.
+STAGE = {"values": None, "owner": None, "changed": None}
+
+
+def load_settings():
+    settings = dict(DEFAULTS)
+    try:
+        stored = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        stored = {}
+    if isinstance(stored, dict):
+        settings.update({key: value for key, value in stored.items() if key in DEFAULTS})
+    if STAGE["values"]:
+        settings.update(STAGE["values"])
+    return settings
+
+
+def save_setting(key, value):
+    if STAGE["values"] is not None:
+        STAGE["values"][key] = value
+        if STAGE["changed"]:
+            STAGE["changed"]()
+        return
+    write_settings({key: value})
+
+
+def write_settings(values):
+    settings = load_settings()
+    settings.update(values)
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = SETTINGS_FILE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(SETTINGS_FILE)
+
+
+def speech_engine():
+    try:
+        result = subprocess.run([str(BIN / "voice-commands-speak"), "engine"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return "none"
+    return result.stdout.strip() or "none"
+
+
+def switch_row(title, subtitle, key, settings):
+    row = Adw.SwitchRow(title=title, subtitle=subtitle)
+    row.set_active(bool(settings[key]))
+    row.connect("notify::active", lambda widget, _param: save_setting(key, widget.get_active()))
+    return row
+
+
+def combo_row(title, subtitle, names, values, key, settings):
+    row = Adw.ComboRow(title=title, model=Gtk.StringList.new(names))
+    if subtitle:
+        row.set_subtitle(subtitle)
+    row.set_selected(values.index(settings[key]) if settings[key] in values else values.index(DEFAULTS[key]))
+    row.connect("notify::selected", lambda widget, _param: save_setting(key, values[widget.get_selected()]))
+    return row
+
+
+SHORTCUT_ACTIONS = ["toggle", "cancel", "window", "send", "type"]
+MODIFIERS = {"SUPER": "SUPER", "WIN": "SUPER", "META": "SUPER", "MOD4": "SUPER", "SHIFT": "SHIFT",
+             "CTRL": "CTRL", "CONTROL": "CTRL", "STRG": "CTRL", "ALT": "ALT"}
+
+
+def helper(*args, timeout=15):
+    try:
+        return subprocess.run([str(BIN / "voice-commands-shortcuts"), *args], capture_output=True, text=True,
+                              timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def shortcut_info():
+    """The desktop whose shortcuts count, where its shortcuts are stored, their defaults, and whether they
+    can be set here. Each desktop keeps its own, because Plasma already uses Super+G."""
+    info = {"desktop": "other", "key": "shortcuts", "can_set": False,
+            "defaults": {"toggle": "SUPER + G", "cancel": "SUPER + SHIFT + G", "window": "SUPER + ALT + G",
+                         "send": "SUPER + CTRL + G", "type": "SUPER + I"}}
+    result = helper("info", timeout=5)
+    try:
+        found = json.loads(result.stdout) if result else {}
+    except ValueError:
+        found = {}
+    if isinstance(found, dict) and found.get("key") in ("shortcuts", "shortcuts_kde", "shortcuts_gnome"):
+        info.update(found)
+    return info
+
+
+SHORTCUT_INFO = shortcut_info()
+SHORTCUT_DEFAULTS = SHORTCUT_INFO["defaults"]
+SHORTCUTS_KEY = SHORTCUT_INFO["key"]
+DESKTOP = SHORTCUT_INFO["desktop"]
+
+
+def desktop_label(name):
+    """A text written for this desktop if there is one, such as used_body_kde, otherwise the general one."""
+    return LABELS.get(f"{name}_{DESKTOP}", LABELS[name])
+
+
+def shortcut_for_people(action):
+    result = helper("show", action, timeout=3)
+    defaults = {"toggle": "Super+G", "cancel": "Super+Shift+G", "window": "Super+Alt+G",
+                "send": "Super+Ctrl+G", "type": "Super+I"}
+    return (result.stdout.strip() if result else "") or defaults[action]
+
+
+def normalize_shortcut(text):
+    """'super+shift+g' -> 'SUPER + SHIFT + G', or None if it is not a valid shortcut."""
+    parts = [part.strip() for part in text.split("+") if part.strip()]
+    if not parts:
+        return None
+    mods = []
+    for part in parts[:-1]:
+        mod = MODIFIERS.get(part.upper())
+        if mod is None or mod in mods:
+            return None
+        mods.append(mod)
+    key = parts[-1]
+    if len(key) == 1:
+        key = key.upper()
+    if not re.fullmatch(r"[A-Za-z0-9_]+", key) or key.upper() in MODIFIERS:
+        return None
+    if Gdk.keyval_from_name(key) in (0, Gdk.KEY_VoidSymbol) and Gdk.keyval_from_name(key.lower()) in (0, Gdk.KEY_VoidSymbol):
+        return None
+    order = ["SUPER", "CTRL", "ALT", "SHIFT"]
+    return " + ".join(sorted(mods, key=order.index) + [key])
+
+
+def keycode_for(combo):
+    """Hardware key code of the key, because Hyprland lists some binds only as code:<number>."""
+    key = combo.split(" + ")[-1]
+    display = Gdk.Display.get_default()
+    for name in (key, key.lower()):
+        keyval = Gdk.keyval_from_name(name)
+        if keyval in (0, Gdk.KEY_VoidSymbol) or display is None:
+            continue
+        found, keys = display.map_keyval(keyval)
+        if found and keys:
+            return min(k.keycode for k in keys)
+    return 0
+
+
+def shortcut_uses(combo):
+    """What the desktop already does on these keys, apart from Voice Commands itself, or None if Plasma
+    cannot use these keys."""
+    result = helper("used", combo, str(keycode_for(combo)), timeout=10)
+    if result is not None and result.returncode == 3:
+        return None
+    if result is None or result.returncode != 1:
+        return []
+    uses = []
+    for line in result.stdout.splitlines():
+        name = "function" if line.startswith("function:") else line.strip()
+        text = LABELS["uses"].get(name, name)
+        if text and text not in uses:
+            uses.append(text)
+    return uses
+
+
+def tell(parent, heading, body):
+    alert = Adw.AlertDialog(heading=heading, body=body)
+    alert.add_response("ok", LABELS["ok"])
+    alert.present(parent)
+
+
+def shortcut_problems():
+    """Problems with the shortcuts as text, an empty list if they work, or None outside Hyprland and Plasma."""
+    result = helper("check", timeout=10)
+    if result is None or result.returncode == 2:
+        return None
+    problems = []
+    for line in result.stdout.splitlines():
+        kind, _action, combo = (line.split(" ", 2) + ["", ""])[:3]
+        if kind in ("missing", "conflict"):
+            problems.append(LABELS[kind].format(combo=combo))
+        elif kind == "classic":
+            problems.append(LABELS["classic"])
+    return problems
+
+
+MODIFIER_KEYS = {"Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R", "Super_L", "Super_R",
+                 "Meta_L", "Meta_R", "ISO_Level3_Shift", "Hyper_L", "Hyper_R", "Caps_Lock"}
+CAPTURE_SECONDS = 20
+
+
+def combo_from_event(controller, keyval, keycode, state):
+    """'SUPER + SHIFT + G' from a key press, using the key itself and not what Shift turns it into."""
+    mods = []
+    if state & Gdk.ModifierType.SUPER_MASK:
+        mods.append("SUPER")
+    if state & Gdk.ModifierType.CONTROL_MASK:
+        mods.append("CTRL")
+    if state & Gdk.ModifierType.ALT_MASK:
+        mods.append("ALT")
+    if state & Gdk.ModifierType.SHIFT_MASK:
+        mods.append("SHIFT")
+    base = keyval
+    display = Gdk.Display.get_default()
+    if display is not None:
+        translated = display.translate_key(keycode, 0, controller.get_group())
+        if translated[0]:
+            base = translated[1]
+    name = Gdk.keyval_name(base) or ""
+    if len(name) == 1:
+        name = name.upper()
+    return " + ".join(mods + [name])
+
+
+def capture_keys(parent, action_title, on_combo):
+    """Asks for a key combination. The desktop's shortcuts are off meanwhile, so that every key reaches
+    this dialog. Returns False if that is not possible."""
+    started = helper("capture", "start", timeout=5)
+    if started is None or started.returncode != 0:
+        helper("capture", "stop", timeout=5)
+        return False
+    dialog = Adw.Dialog(title=LABELS["press_title"], content_width=440)
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, focusable=True)
+    for side in ("top", "bottom", "start", "end"):
+        getattr(box, f"set_margin_{side}")(24)
+    box.append(Gtk.Label(label=LABELS["press"].format(action=action_title), wrap=True, css_classes=["title-4"]))
+    held = Gtk.Label(label="…", css_classes=["title-1"])
+    box.append(held)
+    box.append(Gtk.Label(label=desktop_label("press_hint"), wrap=True, css_classes=["dim-label"]))
+    view = Adw.ToolbarView()
+    view.add_top_bar(Adw.HeaderBar())
+    view.set_content(box)
+    dialog.set_child(view)
+    result = {}
+
+    def pressed(controller, keyval, keycode, state):
+        name = Gdk.keyval_name(keyval) or ""
+        if name in MODIFIER_KEYS:
+            # Show the modifiers held so far
+            shown = combo_from_event(controller, keyval, keycode, state).rsplit(" + ", 1)[0]
+            extra = {"Super": "SUPER", "Control": "CTRL", "Alt": "ALT", "Shift": "SHIFT"}.get(name.split("_")[0])
+            parts = [p for p in shown.split(" + ") if p in ("SUPER", "CTRL", "ALT", "SHIFT")]
+            if extra and extra not in parts:
+                parts.append(extra)
+            held.set_label(" + ".join(parts) + " + …" if parts else "…")
+            return True
+        if keyval == Gdk.KEY_Escape and not state & (Gdk.ModifierType.SUPER_MASK | Gdk.ModifierType.CONTROL_MASK
+                                                     | Gdk.ModifierType.ALT_MASK | Gdk.ModifierType.SHIFT_MASK):
+            dialog.close()
+            return True
+        result["combo"] = combo_from_event(controller, keyval, keycode, state)
+        dialog.close()
+        return True
+
+    def closed(_dialog):
+        if result.get("timer"):
+            GLib.source_remove(result["timer"])
+        if result.get("inhibited") is not None:
+            result["inhibited"].restore_system_shortcuts()
+        helper("capture", "stop", timeout=5)
+        if "combo" in result:
+            on_combo(result["combo"])
+
+    def timeout():
+        result["timer"] = None
+        dialog.close()
+        return False
+
+    keys = Gtk.EventControllerKey()
+    keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+    keys.connect("key-pressed", pressed)
+    dialog.add_controller(keys)
+    dialog.connect("closed", closed)
+    result["timer"] = GLib.timeout_add_seconds(CAPTURE_SECONDS, timeout)
+    dialog.present(parent)
+    box.grab_focus()
+    # GNOME has no switch for this: the window asks for its shortcuts to be off, and GNOME asks the user once
+    if DESKTOP == "gnome":
+        root = parent.get_root() if hasattr(parent, "get_root") else None
+        surface = root.get_surface() if root is not None else None
+        if isinstance(surface, Gdk.Toplevel):
+            surface.inhibit_system_shortcuts(None)
+            result["inhibited"] = surface
+    return True
+
+
+def shortcuts_group(dialog, window):
+    settings = load_settings()
+    current = dict(SHORTCUT_DEFAULTS)
+    current.update({k: v for k, v in (settings.get(SHORTCUTS_KEY) or {}).items() if k in current and isinstance(v, str)})
+    group = Adw.PreferencesGroup(title=LABELS["shortcuts"])
+    hyprland = SHORTCUT_INFO["desktop"] == "hyprland"
+    # Hyprland only with its Lua settings (hyprland.lua, 0.55 or newer), not a classic hyprland.conf; and Plasma
+    can_press = bool(SHORTCUT_INFO["can_set"])
+    if can_press:
+        group.set_description(LABELS["shortcuts_press"])
+    else:
+        group.set_description(LABELS["shortcuts_classic"] if hyprland else LABELS["shortcuts_other"])
+    rows = {}
+
+    def show(action):
+        row = rows[action]
+        rows[action].set_subtitle(current[action])
+
+    def apply(action, text):
+        combo = normalize_shortcut(text)
+        if combo is None:
+            dialog.add_toast(Adw.Toast(title=LABELS["shortcut_invalid"].format(combo=text)))
+            show(action)
+            return
+        others = {current[a] for a in SHORTCUT_ACTIONS if a != action}
+        if combo in others:
+            dialog.add_toast(Adw.Toast(title=LABELS["shortcut_twice"].format(combo=combo)))
+            show(action)
+            return
+        if combo == current[action]:
+            show(action)
+            return
+        uses = shortcut_uses(combo)
+        if uses is None:
+            show(action)
+            dialog.add_toast(Adw.Toast(title=LABELS["shortcut_unusable"].format(combo=combo)))
+            return
+        if uses:
+            show(action)
+            tell(dialog, LABELS["used_title"],
+                 desktop_label("used_body").format(combo=combo, uses=", ".join(uses)))
+            return
+        current[action] = combo
+        show(action)
+        save_shortcuts()
+
+    def save_shortcuts():
+        save_setting(SHORTCUTS_KEY, dict(current))
+        # Hints naming shortcuts already show the new ones; the desktop gets them when applied
+        if hasattr(dialog, "show_shortcuts"):
+            dialog.show_shortcuts()
+
+    def applied():
+        helper("write")
+        # Hyprland needs a moment to load the new settings before they can be checked
+        GLib.timeout_add(1200, lambda: (report(), False)[1])
+
+    dialog.shortcuts_applied = applied
+
+    def report():
+        problems = shortcut_problems()
+        message = LABELS["banner"].format(problems=", ".join(problems)) if problems else LABELS["shortcut_saved"]
+        dialog.add_toast(Adw.Toast(title=message, timeout=6 if problems else 2))
+        window.check_shortcuts()
+        # Hints naming shortcuts, in the settings and in the empty overview
+        if hasattr(dialog, "show_shortcuts"):
+            dialog.show_shortcuts()
+        window.refresh()
+
+    def change(_button, action):
+        title = LABELS[f"shortcut_{action}"]
+        if not capture_keys(dialog, title, lambda combo: apply(action, combo)):
+            dialog.add_toast(Adw.Toast(title=LABELS["press_failed"]))
+
+    def reset(_row):
+        blocked = []
+        for action in SHORTCUT_ACTIONS:
+            combo = SHORTCUT_DEFAULTS[action]
+            if combo == current[action]:
+                continue
+            uses = shortcut_uses(combo)
+            if uses:
+                blocked.append(f"{combo}: {', '.join(uses)}")
+            elif uses is None:
+                blocked.append(combo)
+            else:
+                current[action] = combo
+        for action in SHORTCUT_ACTIONS:
+            show(action)
+        save_shortcuts()
+        if blocked:
+            tell(dialog, LABELS["used_title"],
+                 desktop_label("used_reset").format(list="\n".join(blocked)))
+
+    for action in SHORTCUT_ACTIONS:
+        row = Adw.ActionRow(title=LABELS[f"shortcut_{action}"], subtitle=current[action])
+        if can_press:
+            button = Gtk.Button(label=LABELS["change"], valign=Gtk.Align.CENTER)
+            button.connect("clicked", change, action)
+            row.add_suffix(button)
+        group.add(row)
+        rows[action] = row
+    restore = Adw.ButtonRow(title=LABELS["shortcut_reset"])
+    restore.set_sensitive(can_press)
+    restore.connect("activated", reset)
+    group.add(restore)
+    return group
+
+
+# Help texts: next to the programs in a copy of the source, otherwise in the package
+HELP_DIR = BIN.parent / "help" if (BIN.parent / "help").is_dir() else Path("/usr/share/voice-commands/help")
+WELCOME_SHOWN = CONFIG_HOME / "voice-commands" / "welcome-shown"
+
+
+def help_text(name):
+    """Markdown help in the system language, with the current shortcuts filled in."""
+    language = "de" if system_language() == "de" else "en"
+    for candidate in (f"{name}.{language}.md" if name else f"{language}.md", f"{name}.en.md" if name else "en.md"):
+        try:
+            text = (HELP_DIR / candidate).read_text(encoding="utf-8")
+            break
+        except OSError:
+            continue
+    else:
+        return ""
+    for action in SHORTCUT_ACTIONS:
+        text = text.replace("{" + action + "}", shortcut_for_people(action))
+    return text
+
+
+def markdown_view(markdown):
+    label = Gtk.Label(wrap=True, selectable=True, xalign=0, valign=Gtk.Align.START)
+    label.set_wrap_mode(2)
+    markup = MARKDOWN.to_pango(markdown)
+    if markup is None:
+        label.set_text(markdown)
+    else:
+        label.set_markup(markup)
+    for side in ("top", "bottom", "start", "end"):
+        getattr(label, f"set_margin_{side}")(24)
+    return label
+
+
+def help_dialog(window):
+    dialog = Adw.Dialog(title=LABELS["help"], content_width=680, content_height=720)
+    scroller = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+    text = markdown_view(help_text(""))
+    scroller.set_child(text)
+    view = Adw.ToolbarView()
+    view.add_top_bar(Adw.HeaderBar())
+    view.set_content(scroller)
+    dialog.set_child(view)
+    dialog.present(window)
+
+    # A selectable text would get the focus with everything selected, so it becomes selectable only after
+    # the dialog has opened at the top
+    text.set_selectable(False)
+    GLib.timeout_add(300, lambda: (text.set_selectable(True), False)[1])
+
+
+def welcome_dialog(window):
+    dialog = Adw.Dialog(title=LABELS["welcome"], content_width=560)
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    box.append(markdown_view(help_text("welcome")))
+    buttons = Gtk.Box(spacing=12, halign=Gtk.Align.END)
+    for side in ("bottom", "start", "end"):
+        getattr(buttons, f"set_margin_{side}")(24)
+    more = Gtk.Button(label=LABELS["open_help"])
+    more.connect("clicked", lambda _b: (dialog.close(), help_dialog(window)))
+    start = Gtk.Button(label=LABELS["start"], css_classes=["suggested-action"])
+    start.connect("clicked", lambda _b: dialog.close())
+    buttons.append(more)
+    buttons.append(start)
+    box.append(buttons)
+    view = Adw.ToolbarView()
+    view.add_top_bar(Adw.HeaderBar())
+    view.set_content(box)
+    dialog.set_child(view)
+    dialog.present(window)
+    start.grab_focus()
+
+
+def show_welcome_once(window):
+    if WELCOME_SHOWN.exists():
+        return
+    welcome_dialog(window)
+    try:
+        WELCOME_SHOWN.parent.mkdir(parents=True, exist_ok=True)
+        WELCOME_SHOWN.touch()
+    except OSError:
+        pass
+
+
+def pretty_path(path):
+    home = str(Path.home())
+    if path == home:
+        return "~"
+    return "~/" + path[len(home) + 1:] if path.startswith(home + "/") else path
+
+
+def load_folders():
+    folders = []
+    for item in load_settings().get("folders") or []:
+        if isinstance(item, dict) and isinstance(item.get("path"), str) and item["path"].startswith("/"):
+            folders.append({"path": item["path"], "write": item.get("write") is True})
+    return folders
+
+
+def folders_group(dialog):
+    """Folders Claude may use without asking. voice-commands-permission reads the same list."""
+    group = Adw.PreferencesGroup(title=LABELS["folders"], description=LABELS["folders_sub"])
+    # Always visible, as the user asked: the warning cannot be folded away
+    tips = Adw.ActionRow(title=LABELS["folder_tips"], subtitle=LABELS["folder_tips_body"],
+                         use_markup=False, activatable=False, subtitle_selectable=True)
+    tips.set_subtitle_lines(0)
+    icon = Gtk.Image(icon_name="dialog-warning-symbolic", valign=Gtk.Align.START, margin_top=12)
+    icon.add_css_class("warning")
+    tips.add_prefix(icon)
+    group.add(tips)
+    rows = []
+
+    def warn(heading, body, ok, on_yes, on_no=None):
+        alert = Adw.AlertDialog(heading=heading, body=body)
+        alert.add_response("cancel", LABELS["cancel"])
+        alert.add_response("ok", ok)
+        alert.set_response_appearance("ok", Adw.ResponseAppearance.DESTRUCTIVE)
+        alert.set_default_response("cancel")
+        alert.set_close_response("cancel")
+        alert.connect("response", lambda _alert, response: on_yes() if response == "ok" else on_no and on_no())
+        alert.present(dialog)
+
+    def save(folders):
+        save_setting("folders", folders)
+        show()
+
+    def set_write(path, write):
+        folders = load_folders()
+        for item in folders:
+            if item["path"] == path:
+                item["write"] = write
+        save_setting("folders", folders)
+
+    def access_changed(widget, path):
+        if widget.get_selected() == 0:
+            set_write(path, False)
+            return
+        if any(item["path"] == path and item["write"] for item in load_folders()):
+            return
+        warn(LABELS["folder_write_title"], LABELS["folder_write_body"].format(path=pretty_path(path)),
+             LABELS["folder_write_ok"], lambda: set_write(path, True), lambda: widget.set_selected(0))
+
+    def remove(path):
+        save([item for item in load_folders() if item["path"] != path])
+
+    def show():
+        for row in rows:
+            group.remove(row)
+        rows.clear()
+        for item in load_folders():
+            row = Adw.ActionRow(title=pretty_path(item["path"]))
+            row.set_title_lines(1)
+            row.set_tooltip_text(item["path"])
+            access = Gtk.DropDown.new_from_strings(LABELS["folder_access"])
+            access.set_valign(Gtk.Align.CENTER)
+            access.set_selected(1 if item["write"] else 0)
+            access.connect("notify::selected", lambda widget, _param, path=item["path"]: access_changed(widget, path))
+            row.add_suffix(access)
+            delete = Gtk.Button(icon_name="user-trash-symbolic", tooltip_text=LABELS["folder_remove"],
+                                valign=Gtk.Align.CENTER)
+            delete.add_css_class("flat")
+            delete.connect("clicked", lambda _button, path=item["path"]: remove(path))
+            row.add_suffix(delete)
+            group.add(row)
+            rows.append(row)
+        add = Adw.ButtonRow(title=LABELS["folder_add"], start_icon_name="folder-new-symbolic")
+        add.connect("activated", lambda _row: choose())
+        group.add(add)
+        rows.append(add)
+
+    def add_folder(path):
+        folders = [item for item in load_folders() if item["path"] != path]
+        folders.append({"path": path, "write": False})
+        save(folders)
+
+    def chosen(chooser, result):
+        try:
+            folder = chooser.select_folder_finish(result)
+        except GLib.Error:
+            return
+        path = folder.get_path() if folder else None
+        if not path:
+            return
+        path = os.path.realpath(path)
+        if path == "/":
+            tell(dialog, LABELS["folders"], LABELS["folder_root"])
+            return
+        home = os.path.realpath(Path.home())
+        # Home and everything above or beside it hold settings and private data of all kinds
+        if path == home or home.startswith(path + "/") or path in ("/etc", "/usr", "/var", "/mnt", "/media", "/run"):
+            warn(LABELS["folder_wide_title"], LABELS["folder_wide_body"].format(path=pretty_path(path)),
+                 LABELS["folder_wide_ok"], lambda: add_folder(path))
+            return
+        # Hidden folders in home, such as ~/.config, hold settings, logins and keys
+        if path.startswith(home + "/") and path[len(home) + 1:].startswith("."):
+            warn(LABELS["folder_hidden_title"], LABELS["folder_hidden_body"].format(path=pretty_path(path)),
+                 LABELS["folder_wide_ok"], lambda: add_folder(path))
+            return
+        add_folder(path)
+
+    def choose():
+        chooser = Gtk.FileDialog(title=LABELS["folder_add"].rstrip(" …"))
+        chooser.select_folder(dialog.get_root(), None, chosen)
+
+    show()
+    return group
+
+
+def custom_folders_dialog(parent, name):
+    """The own folders where one reading file command runs without asking."""
+    dialog = Adw.PreferencesDialog(title=LABELS["scope_folders"].format(name=name), content_width=560,
+                                   content_height=460)
+    page = Adw.PreferencesPage()
+    group = Adw.PreferencesGroup(title=LABELS["scope_folders"].format(name=name),
+                                 description=LABELS["scope_folders_sub"].format(name=name))
+    page.add(group)
+    dialog.add(page)
+    rows = []
+
+    def stored():
+        return COMMANDS.custom_folders(name, load_settings())
+
+    def save(paths):
+        value = load_settings().get("file_command_custom")
+        value = dict(value) if isinstance(value, dict) else {}
+        value[name] = paths
+        save_setting("file_command_custom", value)
+        show()
+
+    def add(path):
+        save([item for item in stored() if item != path] + [path])
+
+    def warn(heading_text, body, on_yes):
+        alert = Adw.AlertDialog(heading=heading_text, body=body)
+        alert.add_response("cancel", LABELS["cancel"])
+        alert.add_response("ok", LABELS["folder_wide_ok"])
+        alert.set_response_appearance("ok", Adw.ResponseAppearance.DESTRUCTIVE)
+        alert.set_default_response("cancel")
+        alert.set_close_response("cancel")
+        alert.connect("response", lambda _alert, response: on_yes() if response == "ok" else None)
+        alert.present(dialog)
+
+    def chosen(chooser, result):
+        try:
+            folder = chooser.select_folder_finish(result)
+        except GLib.Error:
+            return
+        path = folder.get_path() if folder else None
+        if not path:
+            return
+        path = os.path.realpath(path)
+        if path == "/":
+            tell(dialog, LABELS["scope_folders"].format(name=name), LABELS["folder_root"])
+            return
+        home = os.path.realpath(Path.home())
+        if path == home or home.startswith(path + "/") or path in ("/etc", "/usr", "/var", "/mnt", "/media", "/run"):
+            warn(LABELS["folder_wide_title"], LABELS["folder_wide_body"].format(path=pretty_path(path)),
+                 lambda: add(path))
+            return
+        if path.startswith(home + "/") and path[len(home) + 1:].startswith("."):
+            warn(LABELS["folder_hidden_title"], LABELS["folder_hidden_body"].format(path=pretty_path(path)),
+                 lambda: add(path))
+            return
+        add(path)
+
+    def choose():
+        chooser = Gtk.FileDialog(title=LABELS["commands_folder_add"].rstrip(" …"))
+        chooser.select_folder(dialog.get_root(), None, chosen)
+
+    def show():
+        for row in rows:
+            group.remove(row)
+        rows.clear()
+        for path in stored():
+            row = Adw.ActionRow(title=pretty_path(path), activatable=False)
+            row.set_title_lines(1)
+            row.set_tooltip_text(path)
+            row.add_prefix(Gtk.Image(icon_name="folder-symbolic"))
+            delete = Gtk.Button(icon_name="user-trash-symbolic", tooltip_text=LABELS["commands_folder_remove"],
+                                valign=Gtk.Align.CENTER, css_classes=["flat"])
+            delete.connect("clicked", lambda _button, path=path: save([item for item in stored() if item != path]))
+            row.add_suffix(delete)
+            group.add(row)
+            rows.append(row)
+        button = Adw.ButtonRow(title=LABELS["commands_folder_add"], start_icon_name="folder-new-symbolic")
+        button.connect("activated", lambda _row: choose())
+        group.add(button)
+        rows.append(button)
+
+    show()
+    dialog.present(parent)
+
+
+def file_command_row(dialog, name, description, off):
+    """A reading file command with how far it reaches and whether it is on."""
+    row = Adw.ActionRow(title=name, subtitle=description, activatable=False)
+    folders, reach, enable = reach_controls(dialog, name)
+    switch = Gtk.Switch(active=name not in off, valign=Gtk.Align.CENTER)
+    enable(switch.get_active())
+
+    def switched(widget, _param):
+        on = widget.get_active()
+        enable(on)
+        current = COMMANDS.turned_off(load_settings())
+        current.discard(name) if on else current.add(name)
+        save_setting("commands_off", sorted(current))
+
+    switch.connect("notify::active", switched)
+    row.add_suffix(folders)
+    row.add_suffix(reach)
+    row.add_suffix(switch)
+    return row
+
+
+def reach_controls(dialog, name):
+    """The drop-down for how far a reading file command reaches and the button for its own folders, and
+    a function that makes both usable or not."""
+    settings = load_settings()
+    scope = COMMANDS.scope_of(name, settings)
+    names = LABELS["scope_names"]
+    reach = Gtk.DropDown.new_from_strings(names)
+    reach.set_valign(Gtk.Align.CENTER)
+    reach.set_selected(COMMANDS.SCOPES.index(scope))
+    reach.set_tooltip_text(LABELS["commands_files_sub"])
+    folders = Gtk.Button(icon_name="folder-open-symbolic", tooltip_text=LABELS["scope_folders_button"],
+                         valign=Gtk.Align.CENTER, css_classes=["flat"], visible=scope == "custom")
+    folders.connect("clicked", lambda _button: custom_folders_dialog(dialog, name))
+    state = {"scope": scope}
+
+    def store(new):
+        value = load_settings().get("file_command_scopes")
+        value = dict(value) if isinstance(value, dict) else {}
+        value[name] = new
+        save_setting("file_command_scopes", value)
+        state["scope"] = new
+        folders.set_visible(new == "custom")
+        if new == "custom" and not COMMANDS.custom_folders(name, load_settings()):
+            custom_folders_dialog(dialog, name)
+
+    def changed(widget, _param):
+        new = COMMANDS.SCOPES[widget.get_selected()]
+        if new == state["scope"]:
+            return
+        # Wide scopes need a confirmation; cancelling goes back to the previous choice
+        if new in ("home", "system", "everywhere"):
+            alert = Adw.AlertDialog(heading=LABELS["scope_wide_title"],
+                                    body=LABELS["scope_wide_body"].format(name=name, where=LABELS[f"scope_wide_{new}"],
+                                                                 missed=LABELS[f"scope_missed_{new}"]))
+            alert.add_response("cancel", LABELS["cancel"])
+            alert.add_response("ok", LABELS["folder_wide_ok"])
+            alert.set_response_appearance("ok", Adw.ResponseAppearance.DESTRUCTIVE)
+            alert.set_default_response("cancel")
+            alert.set_close_response("cancel")
+            alert.connect("response", lambda _alert, response: store(new) if response == "ok"
+                          else widget.set_selected(COMMANDS.SCOPES.index(state["scope"])))
+            alert.present(dialog)
+            return
+        store(new)
+
+    def enable(on):
+        reach.set_sensitive(on)
+        folders.set_sensitive(on)
+
+    reach.connect("notify::selected", changed)
+    return folders, reach, enable
+
+
+def commands_group(dialog):
+    """Commands Claude may run without asking. voice-commands-commands decides with the same lists."""
+    group = Adw.PreferencesGroup(title=LABELS["commands_title"], description=LABELS["commands_sub"])
+    german = system_language() == "de"
+
+    def set_off(name, on):
+        off = COMMANDS.turned_off(load_settings())
+        off.discard(name) if on else off.add(name)
+        save_setting("commands_off", sorted(off))
+
+    # Built-in commands can only be switched off, so that they can be switched on again later
+    expanders = []
+    for title, sub, commands in ((LABELS["commands_info"], LABELS["commands_info_sub"], COMMANDS.SYSTEM_INFO),
+                                 (LABELS["commands_files"], LABELS["commands_files_sub"], COMMANDS.WORK_FILES)):
+        expander = Adw.ExpanderRow(title=title, subtitle=sub)
+        expanders.append(expander)
+        off = COMMANDS.turned_off(load_settings())
+        for name, (text_de, text_en) in commands.items():
+            if commands is COMMANDS.WORK_FILES:
+                expander.add_row(file_command_row(dialog, name, text_de if german else text_en, off))
+                continue
+            row = Adw.SwitchRow(title=name, subtitle=text_de if german else text_en, active=name not in off)
+            row.connect("notify::active", lambda widget, _param, name=name: set_off(name, widget.get_active()))
+            expander.add_row(row)
+        group.add(expander)
+
+    # Always visible, as the user asked: the warning cannot be folded away
+    tips = Adw.ActionRow(title=LABELS["commands_tips"], subtitle=LABELS["commands_tips_body"],
+                         use_markup=False, activatable=False, subtitle_selectable=True)
+    tips.set_subtitle_lines(0)
+    icon = Gtk.Image(icon_name="dialog-warning-symbolic", valign=Gtk.Align.START, margin_top=12)
+    icon.add_css_class("warning")
+    tips.add_prefix(icon)
+    group.add(tips)
+    own = Adw.ExpanderRow(title=LABELS["commands_own"], subtitle=LABELS["commands_own_sub"])
+    group.add(own)
+    rows = []
+
+    def save(items):
+        save_setting("own_commands", items)
+        show()
+
+    def set_on(text, on):
+        items = COMMANDS.own_commands(load_settings())
+        for item in items:
+            if item["text"] == text:
+                item["on"] = on
+        save_setting("own_commands", items)
+
+    def remove(text):
+        rest = [item for item in COMMANDS.own_commands(load_settings()) if item["text"] != text]
+        # Without any own command for it left, the reach is forgotten, so that adding it again starts
+        # with the working folder instead of silently bringing back a wider reach
+        name = COMMANDS.scopable(text)
+        if name and not any(COMMANDS.scopable(item["text"]) == name for item in rest):
+            for key in ("file_command_scopes", "file_command_custom"):
+                value = load_settings().get(key)
+                if isinstance(value, dict) and name in value:
+                    value = dict(value)
+                    del value[name]
+                    save_setting(key, value)
+        save(rest)
+
+    def add(entry):
+        text = " ".join(entry.get_text().split())
+        if not text:
+            return
+        problem = COMMANDS.own_problem(text)
+        if problem:
+            name = text.split()[0]
+            tell(dialog, LABELS["commands_own"], LABELS[f"commands_problem_{problem}"].format(name=name))
+            return
+        items = COMMANDS.own_commands(load_settings())
+        if any(item["text"] == text for item in items):
+            tell(dialog, LABELS["commands_own"], LABELS["commands_problem_twice"])
+            return
+        body = LABELS["commands_add_body_scoped" if COMMANDS.scopable(text) else "commands_add_body"].format(
+            command=text, name=text.split()[0])
+        kind = COMMANDS.risk(text)
+        if kind:
+            body = LABELS[f"risk_{kind}"] + "\n\n" + body
+        alert = Adw.AlertDialog(heading=LABELS["commands_add_title"], body=body)
+        alert.add_response("cancel", LABELS["cancel"])
+        alert.add_response("ok", LABELS["commands_add_ok"])
+        alert.set_response_appearance("ok", Adw.ResponseAppearance.DESTRUCTIVE)
+        alert.set_default_response("cancel")
+        alert.set_close_response("cancel")
+
+        def answered(_alert, response):
+            if response == "ok":
+                entry.set_text("")
+                save(items + [{"text": text, "on": True}])
+
+        alert.connect("response", answered)
+        alert.present(dialog)
+
+    def show():
+        for row in rows:
+            own.remove(row)
+        rows.clear()
+        for item in COMMANDS.own_commands(load_settings()):
+            name = COMMANDS.scopable(item["text"])
+            if name:
+                # Known reading programs choose their reach like the built-in file commands
+                row = Adw.ActionRow(title=item["text"], activatable=False)
+                row.set_use_markup(False)
+                folders, reach, enable = reach_controls(dialog, name)
+                switch = Gtk.Switch(active=item["on"], valign=Gtk.Align.CENTER)
+                enable(item["on"])
+
+                def switched(widget, _param, text=item["text"], enable=enable):
+                    enable(widget.get_active())
+                    set_on(text, widget.get_active())
+
+                switch.connect("notify::active", switched)
+                row.add_suffix(folders)
+                row.add_suffix(reach)
+                row.add_suffix(switch)
+            else:
+                row = Adw.SwitchRow(title=item["text"], active=item["on"])
+                row.set_use_markup(False)
+                row.connect("notify::active", lambda widget, _param, text=item["text"]: set_on(text, widget.get_active()))
+            delete = Gtk.Button(icon_name="user-trash-symbolic", tooltip_text=LABELS["commands_remove"],
+                                valign=Gtk.Align.CENTER, css_classes=["flat"])
+            delete.connect("clicked", lambda _button, text=item["text"]: remove(text))
+            row.add_prefix(delete)
+            own.add_row(row)
+            rows.append(row)
+        entry = Adw.EntryRow(title=LABELS["commands_add"], show_apply_button=True)
+        entry.connect("apply", add)
+        own.add_row(entry)
+        rows.append(entry)
+
+    show()
+    return group
+
+
+def settings_dialog(window):
+    STAGE["values"] = {}
+    settings = load_settings()
+    dialog = Adw.PreferencesDialog(title=LABELS["settings"])
+    STAGE["owner"] = dialog
+    follow_window_size(dialog, window)
+    pending_bar(dialog, window)
+    page = Adw.PreferencesPage()
+    dialog.add(page)
+
+    look = Adw.PreferencesGroup(title=LABELS["look"])
+    scheme = combo_row(LABELS["appearance"], LABELS["appearance_sub"], LABELS["appearance_options"],
+                       THEME.APPEARANCES, "appearance", settings)
+    look.add(scheme)
+    page.add(look)
+
+    speech = Adw.PreferencesGroup(title=LABELS["speech"])
+    speak = switch_row(LABELS["speak"], "", "speak", settings)
+    speech.add(speak)
+    speech.add(combo_row(LABELS["scope"], "", LABELS["scope_options"], SCOPES, "speak_scope", settings))
+    speech.add(combo_row(LABELS["rate"], "", LABELS["rate_options"], RATES, "speak_rate", settings))
+    engine = speech_engine()
+    voice = Adw.ActionRow(title=LABELS["voice"], subtitle=LABELS[f"voice_{engine}"])
+    voice.set_subtitle_lines(0)
+    if engine != "none":
+        sample = Gtk.Button(label=LABELS["try"], valign=Gtk.Align.CENTER)
+        sample.connect("clicked", lambda _button: play_sample())
+        voice.add_suffix(sample)
+    speech.add(voice)
+    page.add(speech)
+
+    commands = Adw.PreferencesGroup(title=LABELS["commands"])
+    commands.add(combo_row(LABELS["language"], LABELS["language_sub"], LABELS["language_options"], LANGUAGES,
+                           "recognition_language", settings))
+    countdown = combo_row(LABELS["countdown"], "",
+                          [LABELS["countdown_off"] if n == 0 else LABELS["seconds"].format(n=n) for n in COUNTDOWNS],
+                          COUNTDOWNS, "countdown", settings)
+    commands.add(countdown)
+
+    # Texts that name shortcuts; shown again whenever a shortcut is changed in this dialog
+    def show_shortcuts():
+        cancel = shortcut_for_people("cancel")
+        speak.set_subtitle(LABELS["speak_sub"].format(cancel=cancel))
+        countdown.set_subtitle(LABELS["countdown_sub"].format(cancel=cancel, send=shortcut_for_people("send")))
+
+    show_shortcuts()
+    dialog.show_shortcuts = show_shortcuts
+    followup = combo_row(LABELS["followup"], LABELS["followup_sub"], LABELS["followup_options"], FOLLOWUPS,
+                         "followup", settings)
+    followup.set_subtitle_lines(0)
+    commands.add(followup)
+    page.add(commands)
+    page.add(shortcuts_group(dialog, window))
+    page.add(folders_group(dialog))
+    page.add(commands_group(dialog))
+
+    privacy = Adw.PreferencesGroup(title=LABELS["privacy"])
+    keep = combo_row(LABELS["keep"], LABELS["keep_sub"], LABELS["keep_options"], KEEP_DAYS, "keep_sessions", settings)
+    keep.set_subtitle_lines(0)
+
+    privacy.add(keep)
+    page.add(privacy)
+
+    responses = Adw.PreferencesGroup(title=LABELS["window"])
+    responses.add(switch_row(LABELS["open_window"], LABELS["open_window_sub"], "open_window", settings))
+    clear = Adw.ButtonRow(title=LABELS["clear"])
+    clear.add_css_class("destructive-action")
+    clear.connect("activated", lambda _row: confirm_clear(dialog, window))
+    responses.add(clear)
+    page.add(responses)
+    dialog.present(window)
+
+
+def pending_bar(dialog, window):
+    """The bar at the bottom of the settings that applies or discards the changes, and the question when
+    the settings are closed with changes left."""
+    bar = Gtk.Box(spacing=10, margin_top=8, margin_bottom=8, margin_start=16, margin_end=16,
+                  css_classes=["vc-pending"])
+    text = Gtk.Label(label=LABELS["pending_text"], xalign=0, wrap=True, hexpand=True)
+    discard = Gtk.Button(label=LABELS["pending_discard"], valign=Gtk.Align.CENTER, css_classes=["pill"])
+    apply = Gtk.Button(label=LABELS["pending_apply"], valign=Gtk.Align.CENTER, css_classes=["pill", "suggested-action"])
+    bar.append(text)
+    bar.append(discard)
+    bar.append(apply)
+    holder = {"view": None}
+
+    def toolbar_view(widget):
+        child = widget.get_first_child()
+        while child is not None:
+            if isinstance(child, Adw.ToolbarView):
+                return child
+            found = toolbar_view(child)
+            if found is not None:
+                return found
+            child = child.get_next_sibling()
+        return None
+
+    def mapped(*_args):
+        if holder["view"] is None:
+            holder["view"] = toolbar_view(dialog)
+            if holder["view"] is not None:
+                holder["view"].add_bottom_bar(bar)
+        changed()
+
+    def changed():
+        pending = bool(STAGE["values"]) and STAGE["owner"] is dialog
+        if holder["view"] is not None:
+            holder["view"].set_reveal_bottom_bars(pending)
+        dialog.set_can_close(not pending)
+
+    def do_apply(*_args):
+        values = dict(STAGE["values"] or {})
+        STAGE["values"] = {}
+        if values:
+            write_settings(values)
+        THEME.set_scheme(load_settings()["appearance"])
+        if SHORTCUTS_KEY in values and hasattr(dialog, "shortcuts_applied"):
+            dialog.shortcuts_applied()
+        if "keep_sessions" in values:
+            try:
+                subprocess.run([str(BIN / "voice-commands"), "clean-sessions"], timeout=20, check=False)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if hasattr(dialog, "show_shortcuts"):
+            dialog.show_shortcuts()
+        window.refresh()
+        changed()
+        if values:
+            dialog.add_toast(Adw.Toast(title=LABELS["pending_done"], timeout=2))
+
+    def do_discard(*_args):
+        # The rows still show the discarded values, so the settings open again from the stored ones
+        STAGE["values"] = {}
+        changed()
+        dialog.close()
+        settings_dialog(window)
+
+    def close_attempt(_dialog):
+        alert = Adw.AlertDialog(heading=LABELS["pending_title"], body=LABELS["pending_body"])
+        alert.add_response("discard", LABELS["pending_discard"])
+        alert.add_response("back", LABELS["pending_back"])
+        alert.add_response("apply", LABELS["pending_apply"])
+        alert.set_response_appearance("discard", Adw.ResponseAppearance.DESTRUCTIVE)
+        alert.set_response_appearance("apply", Adw.ResponseAppearance.SUGGESTED)
+        alert.set_default_response("apply")
+        alert.set_close_response("back")
+
+        def answered(_alert, response):
+            if response == "back":
+                return
+            if response == "apply":
+                do_apply()
+            else:
+                STAGE["values"] = {}
+                changed()
+            dialog.close()
+
+        alert.connect("response", answered)
+        alert.present(dialog)
+
+    def closed(_dialog):
+        if STAGE["owner"] is dialog:
+            STAGE.update(values=None, owner=None, changed=None)
+
+    STAGE["changed"] = changed
+    dialog.connect("map", mapped)
+    dialog.connect("close-attempt", close_attempt)
+    dialog.connect("closed", closed)
+    apply.connect("clicked", do_apply)
+    discard.connect("clicked", do_discard)
+
+
+# Share of the window the settings cover, also when the window is resized (asked for by the user)
+DIALOG_SHARE = 0.9
+
+
+def clamps(widget):
+    """The width limits libadwaita puts around preference rows, found inside a widget."""
+    child = widget.get_first_child()
+    while child is not None:
+        if isinstance(child, Adw.Clamp):
+            yield child
+        yield from clamps(child)
+        child = child.get_next_sibling()
+
+
+def follow_window_size(dialog, window):
+    size = {"last": None}
+
+    def fit(*_args):
+        current = (window.get_width(), window.get_height())
+        if current != size["last"] and current[0] > 0:
+            size["last"] = current
+            width = max(360, int(current[0] * DIALOG_SHARE))
+            dialog.set_content_width(width)
+            dialog.set_content_height(max(300, int(current[1] * DIALOG_SHARE)))
+            # The rows grow with the dialog instead of stopping at libadwaita's fixed width
+            for clamp in clamps(dialog):
+                clamp.set_maximum_size(width - 48)
+                clamp.set_tightening_threshold(width - 48)
+        return True
+
+    fit()
+    # The rows exist only once the dialog is shown, so their width is set again then
+    dialog.connect("map", lambda *_args: (size.__setitem__("last", None), fit()))
+    # Runs only while the dialog is shown
+    dialog.add_tick_callback(lambda *_args: fit())
+
+
+def play_sample():
+    rate = load_settings()["speak_rate"]
+    try:
+        subprocess.run([str(BIN / "voice-commands-speak"), rate], input=LABELS["sample"].encode("utf-8"),
+                       timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def confirm_clear(parent, window):
+    alert = Adw.AlertDialog(heading=LABELS["clear_title"], body=LABELS["clear_body"])
+    alert.add_response("cancel", LABELS["cancel"])
+    alert.add_response("clear", LABELS["clear"])
+    alert.set_response_appearance("clear", Adw.ResponseAppearance.DESTRUCTIVE)
+    alert.set_default_response("cancel")
+
+    def answered(_alert, response):
+        if response == "clear":
+            try:
+                change_history(lambda lines: lines.clear())
+            except OSError:
+                pass
+            # A pending single deletion is covered by this, so nothing is left to do for it later
+            window.pending.clear()
+            try:
+                subprocess.Popen([str(BIN / "voice-commands"), "delete-all-sessions"], start_new_session=True,
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except OSError:
+                pass
+            window.refresh()
+
+    alert.connect("response", answered)
+    alert.present(parent)
+
+
+class Reader:
+    """Reads one saved response aloud at a time; its button turns into a stop button meanwhile."""
+    button = None
+
+    @classmethod
+    def toggle(cls, button, reply):
+        if cls.button is button:
+            cls.stop()
+            return
+        cls.stop()
+        try:
+            subprocess.run([str(BIN / "voice-commands-speak"), load_settings()["speak_rate"]],
+                           input=MARKDOWN.to_speech(reply).encode("utf-8"), timeout=10, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            return
+        cls.button = button
+        button.set_icon_name("media-playback-stop-symbolic")
+        button.set_tooltip_text(LABELS["stop"])
+        GLib.timeout_add(400, cls.check, button)
+
+    @classmethod
+    def check(cls, button):
+        if cls.button is not button:
+            return False
+        if SPEAK_PID.exists():
+            return True
+        cls.reset()
+        return False
+
+    @classmethod
+    def stop(cls):
+        subprocess.run([str(BIN / "voice-commands-speak"), "stop"], check=False)
+        cls.reset()
+
+    @classmethod
+    def reset(cls):
+        if cls.button is not None:
+            cls.button.set_icon_name("audio-volume-high-symbolic")
+            cls.button.set_tooltip_text(LABELS["read"])
+        cls.button = None
+
+
+def load_entries():
+    if not HISTORY.exists():
+        return []
+    entries = []
+    for line in HISTORY.read_text(encoding="utf-8").splitlines()[-MAX_ENTRIES:]:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(entry, dict):
+            entry["_line"] = line
+            entries.append(entry)
+    return list(reversed(entries))
+
+
+def change_history(change):
+    """Rewrites the history under the lock that voice-commands also takes when it adds a response."""
+    HISTORY_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with open(HISTORY_LOCK, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            lines = HISTORY.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            lines = []
+        result = change(lines)
+        temporary = HISTORY.with_suffix(".tmp")
+        temporary.write_text("".join(line + "\n" for line in lines), encoding="utf-8")
+        temporary.replace(HISTORY)
+        return result
+
+
+def delete_entries(remove):
+    """Removes the given lines and returns them with their places, for undoing."""
+    def change(lines):
+        removed = []
+        for index in range(len(lines) - 1, -1, -1):
+            if lines[index] in remove:
+                removed.append((index, lines.pop(index)))
+        return sorted(removed)
+    try:
+        return change_history(change)
+    except OSError:
+        return []
+
+
+def restore_entries(removed):
+    def change(lines):
+        for index, line in removed:
+            lines.insert(min(index, len(lines)), line)
+        del lines[:-MAX_ENTRIES]
+    try:
+        change_history(change)
+    except OSError:
+        pass
+
+
+def delete_session(session):
+    """Deletes the conversation from Claude Code's storage; voice-commands waits for a running task first."""
+    try:
+        subprocess.Popen([str(BIN / "voice-commands"), "delete-session", session], start_new_session=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+def session_of(entry):
+    session = entry.get("sitzung", "")
+    if isinstance(session, str) and re.fullmatch(r"[0-9a-fA-F-]{36}", session) and (SESSIONS / f"{session}.jsonl").exists():
+        return session
+    return None
+
+
+def set_button_text(button, text):
+    child = button.get_child()
+    if isinstance(child, Adw.ButtonContent):
+        child.set_label(text)
+    else:
+        button.set_label(text)
+
+
+def action_button(icon, label, tooltip=None):
+    button = Gtk.Button(css_classes=["vc-action"], valign=Gtk.Align.CENTER)
+    button.set_child(Adw.ButtonContent(icon_name=icon, label=label, use_underline=False))
+    if tooltip:
+        button.set_tooltip_text(tooltip)
+    return button
+
+
+def copy_text(button, text):
+    # wl-copy haelt den Inhalt auch dann bereit, wenn das Fenster geschlossen wird
+    # xclip keeps it available on X11 in the same way
+    if os.environ.get("WAYLAND_DISPLAY"):
+        command = ["wl-copy"]
+    else:
+        command = ["xclip", "-selection", "clipboard"]
+    try:
+        subprocess.run(command, input=text.encode("utf-8"), check=True, stdout=subprocess.DEVNULL)
+    except (OSError, subprocess.CalledProcessError):
+        set_button_text(button, LABELS["copy_failed"].format(program=command[0]))
+        return
+    set_button_text(button, LABELS["copied"])
+    button.add_css_class("vc-done")
+    GLib.timeout_add(1500, lambda: (set_button_text(button, LABELS["copy"]), button.remove_css_class("vc-done"), False)[2])
+
+
+def desktop_app_available():
+    try:
+        result = subprocess.run(["xdg-mime", "query", "default", "x-scheme-handler/claude"],
+                                capture_output=True, text=True, check=False)
+    except OSError:
+        return False
+    return bool(result.stdout.strip())
+
+
+def open_in_desktop(button, session):
+    if not desktop_app_available():
+        set_button_text(button, LABELS["desktop_missing"])
+        return
+    # Not an official interface: this is the link Claude Code itself uses for /desktop
+    subprocess.Popen(["xdg-open", f"claude://resume?session={session}"], start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    set_button_text(button, LABELS["desktop_opening"])
+    GLib.timeout_add(2500, lambda: (set_button_text(button, LABELS["desktop"]), False)[1])
+
+
+# Labels become selectable only after the window has opened: otherwise the first one gets the focus with
+# all its text selected
+NOT_YET_SELECTABLE = []
+
+
+def selectable_label(text, *classes):
+    label = Gtk.Label(label=text, wrap=True, selectable=False, xalign=0, hexpand=True)
+    NOT_YET_SELECTABLE.append(label)
+    label.set_wrap_mode(2)  # Woerter, notfalls Zeichen
+    label.set_css_classes(list(classes))
+    return label
+
+
+# Files that would run as a program when opened: these only show their folder, because a file
+# written by Claude could come from a website and must never start anything with a single click
+RUNNABLE = ("application/x-executable", "application/x-pie-executable", "application/x-sharedlib",
+            "application/x-desktop", "application/x-shellscript", "application/x-msdownload",
+            "application/vnd.appimage", "application/x-ms-dos-executable", "application/x-perl",
+            "text/x-python", "application/x-python-code", "application/x-java-archive")
+
+
+def runnable(path):
+    content_type, _uncertain = Gio.content_type_guess(path, None)
+    return os.access(path, os.X_OK) or path.endswith(".desktop") or any(
+        Gio.content_type_is_a(content_type, kind) for kind in RUNNABLE)
+
+
+def open_path(window, path, folder=False):
+    """Opens a file or folder with its usual program, or shows a file in its folder."""
+    launcher = Gtk.FileLauncher.new(Gio.File.new_for_path(path))
+
+    def done(source, result):
+        try:
+            source.open_containing_folder_finish(result) if folder else source.launch_finish(result)
+        except GLib.Error as error:
+            if not error.matches(Gtk.dialog_error_quark(), Gtk.DialogError.DISMISSED):
+                window.toasts.add_toast(Adw.Toast(title=LABELS["open_failed"], timeout=3))
+
+    if folder:
+        launcher.open_containing_folder(window, None, done)
+    else:
+        launcher.launch(window, None, done)
+
+
+def file_chip(path, window):
+    """A file Claude wrote during this command: click opens it, right-click shows its folder."""
+    exists = os.path.isfile(path)
+    content_type, _uncertain = Gio.content_type_guess(path, None)
+    box = Gtk.Box(spacing=6)
+    box.append(Gtk.Image(gicon=Gio.content_type_get_symbolic_icon(content_type)))
+    box.append(Gtk.Label(label=os.path.basename(path), ellipsize=Pango.EllipsizeMode.MIDDLE, max_width_chars=32))
+    chip = Gtk.Button(child=box, css_classes=["vc-file"])
+    shown = pretty_path(path)
+    if not exists:
+        chip.set_sensitive(False)
+        chip.set_tooltip_text(LABELS["file_missing"].format(path=shown))
+        return chip
+    only_folder = runnable(path)
+    chip.set_tooltip_text(LABELS["file_tip_folder" if only_folder else "file_tip"].format(path=shown))
+    chip.connect("clicked", lambda _button: open_path(window, path, folder=only_folder))
+    right = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
+    right.connect("pressed", lambda *_args: open_path(window, path, folder=True))
+    chip.add_controller(right)
+    return chip
+
+
+class Fold(Gtk.Widget):
+    """Shows only the first lines of a label until unfolded. The lines are counted as they appear at
+    the current width, including wrapped lines; GTK's own line limit only counts per paragraph."""
+
+    def __init__(self, label, lines):
+        super().__init__(overflow=Gtk.Overflow.HIDDEN)
+        self.label = label
+        self.lines = lines
+        self.folded = True
+        self.clip = None
+        self.on_needed = None
+        label.set_parent(self)
+
+    def set_folded(self, folded):
+        self.folded = folded
+        self.queue_resize()
+
+    def do_get_request_mode(self):
+        return Gtk.SizeRequestMode.HEIGHT_FOR_WIDTH
+
+    def do_measure(self, orientation, for_size):
+        minimum, natural, _base_min, _base_nat = self.label.measure(orientation, for_size)
+        if orientation == Gtk.Orientation.VERTICAL and self.folded and self.clip is not None:
+            natural = min(natural, self.clip)
+            minimum = min(minimum, natural)
+        return minimum, natural, -1, -1
+
+    def do_size_allocate(self, width, height, baseline):
+        _minimum, full, _base_min, _base_nat = self.label.measure(Gtk.Orientation.VERTICAL, width)
+        self.label.allocate(width, max(full, height), -1, None)
+        # Where the last visible line ends, from the label's own layout at this width
+        layout = self.label.get_layout()
+        _x, offset = self.label.get_layout_offsets()
+        clip = None
+        if layout.get_line_count() > self.lines:
+            lines = layout.get_iter()
+            for _line in range(self.lines - 1):
+                lines.next_line()
+            _top, bottom = lines.get_line_yrange()
+            clip = self.label.get_margin_top() + offset + bottom // Pango.SCALE
+        if clip != self.clip:
+            self.clip = clip
+            # Not while sizes are being given out: changing widgets then confuses GTK
+            GLib.idle_add(self.changed, clip is not None)
+
+    def changed(self, needed):
+        if self.on_needed:
+            self.on_needed(needed)
+        self.queue_resize()
+        return False
+
+    def do_snapshot(self, snapshot):
+        self.snapshot_child(self.label, snapshot)
+
+    def do_dispose(self):
+        if self.label.get_parent() is self:
+            self.label.unparent()
+
+
+def build_entry(entry, can_speak, window):
+    card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0, css_classes=["vc-card"])
+
+    # What the user said, with the time on the right
+    head = Gtk.Box(spacing=10, margin_top=14, margin_bottom=10, margin_start=18, margin_end=18)
+    head.append(Gtk.Label(label="›", css_classes=["vc-command-mark"], valign=Gtk.Align.START))
+    head.append(selectable_label(entry.get("befehl", ""), "vc-command"))
+    head.append(Gtk.Label(label=entry.get("zeit", ""), css_classes=["vc-time"], valign=Gtk.Align.START))
+    card.append(head)
+
+    reply = entry.get("antwort", "")
+    text = selectable_label(reply, "vc-reply")
+    markup = MARKDOWN.to_pango(reply)
+    if markup is not None:
+        text.set_markup(markup)
+    text.set_margin_start(18)
+    text.set_margin_end(18)
+    text.set_margin_bottom(12)
+    card.append(text)
+
+    # Long responses show their first lines until unfolded; every response starts folded
+    plain = MARKDOWN.to_plain(reply).strip()
+    if plain.count("\n") >= FOLD_LINES or len(plain) > FOLD_MIN_CHARS:
+        card.remove(text)
+        folder = Fold(text, FOLD_LINES)
+        card.append(folder)
+        arrow = Gtk.Image(icon_name="pan-end-symbolic")
+        switch_text = Gtk.Label(label=LABELS["fold_more"], xalign=0)
+        switch_box = Gtk.Box(spacing=6)
+        switch_box.append(arrow)
+        switch_box.append(switch_text)
+        switch = Gtk.Button(child=switch_box, css_classes=["vc-action"], halign=Gtk.Align.START,
+                            margin_start=12, margin_bottom=8, visible=False)
+
+        def clicked(_button):
+            folder.set_folded(not folder.folded)
+            arrow.set_from_icon_name("pan-end-symbolic" if folder.folded else "pan-down-symbolic")
+            switch_text.set_label(LABELS["fold_more"] if folder.folded else LABELS["fold_less"])
+
+        switch.connect("clicked", clicked)
+        # Shown only when the text at the current width really has more lines than fit
+        folder.on_needed = lambda needed: (switch.set_visible(needed),
+                                           text.set_margin_bottom(4 if needed else 12))
+        card.append(switch)
+
+    # Files Claude wrote while answering
+    files = [path for path in entry.get("dateien", []) if isinstance(path, str) and path.startswith("/")]
+    if files:
+        chips = Adw.WrapBox(child_spacing=6, line_spacing=6, margin_start=18, margin_end=18, margin_bottom=12)
+        for path in files:
+            chips.append(file_chip(path, window))
+        card.append(chips)
+
+    card.append(Gtk.Box(css_classes=["vc-rule"]))
+    actions = Gtk.Box(spacing=4, margin_top=6, margin_bottom=6, margin_start=10, margin_end=10)
+    copy = action_button("edit-copy-symbolic", LABELS["copy"])
+    copy.connect("clicked", copy_text, reply)
+    actions.append(copy)
+    reader = Gtk.Button(icon_name="audio-volume-high-symbolic", tooltip_text=LABELS["read"],
+                        css_classes=["vc-action"], valign=Gtk.Align.CENTER)
+    if can_speak:
+        reader.connect("clicked", Reader.toggle, reply)
+    else:
+        reader.set_sensitive(False)
+        reader.set_tooltip_text(LABELS["read_missing"])
+    actions.append(reader)
+    actions.append(Gtk.Box(hexpand=True))
+    session = entry.get("sitzung", "")
+    # Only while Claude Code still has the conversation
+    if re.fullmatch(r"[0-9a-fA-F-]{36}", session) and (SESSIONS / f"{session}.jsonl").exists():
+        desktop = action_button("window-new-symbolic", LABELS["desktop"], LABELS["desktop_tip"])
+        desktop.connect("clicked", open_in_desktop, session)
+        actions.append(desktop)
+    delete = Gtk.Button(icon_name="user-trash-symbolic", tooltip_text=f"{LABELS['delete']}\n{LABELS['delete_tip']}",
+                        css_classes=["vc-action", "vc-delete"], valign=Gtk.Align.CENTER)
+    delete.update_property([Gtk.AccessibleProperty.LABEL], [LABELS["delete"]])
+    delete.connect("clicked", lambda _button: window.delete(entry))
+    actions.append(delete)
+    card.append(actions)
+    return card
+
+
+def empty_state():
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, valign=Gtk.Align.CENTER,
+                  halign=Gtk.Align.CENTER, vexpand=True, margin_top=60, margin_bottom=60)
+    icon = Gtk.Image(icon_name="voice-commands", pixel_size=72)
+    box.append(icon)
+    box.append(Gtk.Label(label=LABELS["empty"], css_classes=["vc-empty-title"]))
+    box.append(Gtk.Label(label=LABELS["empty_text"], wrap=True, justify=Gtk.Justification.CENTER,
+                         max_width_chars=46, css_classes=["vc-empty-text"]))
+    keys = Gtk.Box(spacing=6, halign=Gtk.Align.CENTER)
+    for part in shortcut_for_people("toggle").split("+"):
+        if keys.get_first_child() is not None:
+            keys.append(Gtk.Label(label="+", css_classes=["vc-empty-text"]))
+        keys.append(Gtk.Label(label=part.strip(), css_classes=["vc-key"]))
+    box.append(keys)
+    return box
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Voice Commands", default_width=900, default_height=720)
+        self.list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, css_classes=["vc-root"])
+        for side in ("top", "bottom", "start", "end"):
+            getattr(self.list, f"set_margin_{side}")(18)
+
+        scroller = Gtk.ScrolledWindow(vexpand=True)
+        scroller.set_child(self.list)
+        header = Adw.HeaderBar()
+        brand = Gtk.Box(spacing=8)
+        brand.append(Gtk.Image(icon_name="voice-commands", pixel_size=20))
+        brand.append(Gtk.Label(label="Voice Commands", css_classes=["vc-brand"]))
+        header.set_title_widget(brand)
+        header.pack_start(Gtk.Label(label=LABELS["model"], css_classes=["dim-label"]))
+        self.picker = model_picker()
+        header.pack_start(self.picker)
+        folder = Gtk.Button(icon_name="folder-open-symbolic", tooltip_text=LABELS["work_folder_tip"])
+        folder.update_property([Gtk.AccessibleProperty.LABEL], [LABELS["work_folder"]])
+        folder.connect("clicked", lambda _button: (WORK.mkdir(exist_ok=True), open_path(self, str(WORK))))
+        gear = Gtk.Button(icon_name="emblem-system-symbolic", tooltip_text=LABELS["settings"])
+        gear.connect("clicked", lambda _button: settings_dialog(self))
+        header.pack_end(gear)
+        guide = Gtk.Button(icon_name="dialog-question-symbolic", tooltip_text=f"{LABELS['help']} (F1)")
+        guide.connect("clicked", lambda _button: help_dialog(self))
+        header.pack_end(guide)
+        header.pack_end(folder)
+        toolbar = Adw.ToolbarView()
+        toolbar.add_top_bar(header)
+        # Neither Hyprland nor Plasma shows an error for broken shortcuts of Voice Commands, so the window warns
+        self.banner = Adw.Banner(button_label=LABELS["banner_button"])
+        self.banner.connect("button-clicked", lambda _banner: settings_dialog(self))
+        toolbar.add_top_bar(self.banner)
+        self.toasts = Adw.ToastOverlay(child=scroller)
+        self.pending = []
+        self.connect("close-request", self.on_close)
+        toolbar.set_content(self.toasts)
+        self.set_content(toolbar)
+
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", self.on_key)
+        self.add_controller(keys)
+        self.refresh()
+
+    def on_key(self, _ctrl, keyval, _code, _state):
+        if keyval == Gdk.KEY_Escape:
+            self.close()
+            return True
+        if keyval == Gdk.KEY_F1:
+            help_dialog(self)
+            return True
+        return False
+
+    def delete(self, entry):
+        session = session_of(entry)
+        conversation = [e for e in load_entries() if session and session_of(e) == session]
+        others = [e["_line"] for e in conversation if e["_line"] != entry["_line"]]
+        if not others:
+            self.remove([entry["_line"]], session, LABELS["deleted"])
+            return
+        alert = Adw.AlertDialog(heading=LABELS["shared_title"],
+                                body=LABELS["shared_body"].format(n=len(conversation)))
+        def heading(item):
+            row = Gtk.Box(spacing=10)
+            chosen = item["_line"] == entry["_line"]
+            command = item.get("befehl", "")
+            if chosen:
+                command = f"{command}  ← {LABELS['shared_this']}"
+            label = Gtk.Label(label=command, wrap=True, xalign=0, hexpand=True, max_width_chars=1,
+                              css_classes=["vc-command"] if chosen else [])
+            label.set_wrap_mode(2)
+            row.append(label)
+            row.append(Gtk.Label(label=item.get("zeit", ""), css_classes=["vc-time"], valign=Gtk.Align.START))
+            return row
+
+        def answer_label(item, full):
+            label = Gtk.Label(wrap=True, xalign=0, max_width_chars=1)
+            label.set_wrap_mode(2)
+            show_answer(label, item, full)
+            return label
+
+        def show_answer(label, item, full):
+            text = item.get("antwort", "")
+            markup = MARKDOWN.to_pango(text) if full else None
+            if markup is None:
+                label.set_text(text if full else MARKDOWN.to_plain(text).strip())
+            else:
+                label.set_markup(markup)
+            label.set_lines(-1 if full else 3)
+            label.set_ellipsize(Pango.EllipsizeMode.NONE if full else Pango.EllipsizeMode.END)
+
+        # The chosen response stays on top: first its first lines, unfolded its whole answer followed by
+        # the other responses of the conversation, oldest first. The dialog scrolls if that gets long.
+        frame = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["vc-ask-detail"])
+        frame.append(heading(entry))
+        chosen_answer = answer_label(entry, False)
+        frame.append(chosen_answer)
+
+        # The other responses appear below it; the switch stays at the bottom so it never splits them
+        listing = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, margin_top=8)
+        for item in reversed(conversation):
+            if item["_line"] == entry["_line"]:
+                continue
+            listing.append(Gtk.Separator())
+            block = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            block.append(heading(item))
+            block.append(answer_label(item, True))
+            listing.append(block)
+        others_shown = Gtk.Revealer(child=listing, reveal_child=False)
+        frame.append(others_shown)
+
+        more = LABELS["shared_more_one"] if len(others) == 1 else LABELS["shared_more"].format(k=len(others))
+        arrow = Gtk.Image(icon_name="pan-end-symbolic")
+        switch_text = Gtk.Label(label=more, xalign=0)
+        switch_box = Gtk.Box(spacing=6)
+        switch_box.append(arrow)
+        switch_box.append(switch_text)
+        switch = Gtk.Button(child=switch_box, css_classes=["flat"], halign=Gtk.Align.START, margin_top=4)
+        frame.append(switch)
+
+        def toggled(_button):
+            unfold = not others_shown.get_reveal_child()
+            others_shown.set_reveal_child(unfold)
+            show_answer(chosen_answer, entry, unfold)
+            arrow.set_from_icon_name("pan-down-symbolic" if unfold else "pan-end-symbolic")
+            switch_text.set_label(LABELS["shared_less"] if unfold else more)
+
+        switch.connect("clicked", toggled)
+        # A fixed width, so that unfolding only makes the dialog longer; it scrolls when it gets too long
+        extra = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, width_request=460)
+        extra.append(frame)
+        extra.append(Gtk.Label(label=LABELS["shared_hint"], wrap=True, xalign=0, max_width_chars=1,
+                               css_classes=["dim-label"]))
+        alert.set_extra_child(extra)
+        alert.add_response("cancel", LABELS["cancel"])
+        alert.add_response("one", LABELS["shared_one"])
+        alert.add_response("all", LABELS["shared_all"])
+        alert.set_response_appearance("all", Adw.ResponseAppearance.DESTRUCTIVE)
+        alert.set_default_response("cancel")
+        alert.set_close_response("cancel")
+        alert.set_prefer_wide_layout(True)
+
+        def answered(_alert, response):
+            if response == "all":
+                self.remove([entry["_line"], *others], session, LABELS["deleted_all"])
+            elif response == "one":
+                self.remove([entry["_line"]], None, LABELS["deleted"])
+
+        alert.connect("response", answered)
+        alert.present(self)
+
+    def remove(self, lines, session, title):
+        """Removes responses now and the conversation once undoing is no longer possible."""
+        removed = delete_entries(set(lines))
+        self.refresh()
+        if not removed:
+            return
+        pending = {"session": session, "undone": False}
+        self.pending.append(pending)
+
+        def undo(_toast):
+            pending["undone"] = True
+            restore_entries(removed)
+            self.refresh()
+
+        toast = Adw.Toast(title=title, button_label=LABELS["undo"], timeout=6)
+        toast.connect("button-clicked", undo)
+        toast.connect("dismissed", lambda _toast: self.finish(pending))
+        self.toasts.add_toast(toast)
+
+    def finish(self, pending):
+        if pending in self.pending:
+            self.pending.remove(pending)
+            if not pending["undone"] and pending["session"]:
+                delete_session(pending["session"])
+
+    def on_close(self, _window):
+        for pending in list(self.pending):
+            self.finish(pending)
+        return False
+
+    def check_shortcuts(self):
+        problems = shortcut_problems()
+        if problems:
+            self.banner.set_title(LABELS["banner"].format(problems=", ".join(problems)))
+        self.banner.set_revealed(bool(problems))
+
+    def refresh(self):
+        self.check_shortcuts()
+        while (child := self.list.get_first_child()) is not None:
+            self.list.remove(child)
+        Reader.button = None
+        entries = load_entries()
+        can_speak = speech_engine() != "none"
+        if not entries:
+            self.list.append(empty_state())
+        for entry in entries:
+            self.list.append(build_entry(entry, can_speak, self))
+        GLib.timeout_add(300, self.make_selectable)
+
+    def make_selectable(self):
+        focus = self.get_focus()
+        while NOT_YET_SELECTABLE:
+            NOT_YET_SELECTABLE.pop().set_selectable(True)
+        self.set_focus(focus)
+        return False
+
+
+def on_activate(app):
+    if not getattr(app, "themed", False):
+        THEME.apply()
+        app.themed = True
+    window = app.get_active_window() or Window(app)
+    window.refresh()
+    window.present()
+    show_welcome_once(window)
+
+
+GLib.set_prgname("local.voicecommands.VoiceCommands")
+Gtk.Window.set_default_icon_name("voice-commands")
+app = Adw.Application(application_id="local.voicecommands.VoiceCommands")
+app.connect("activate", on_activate)
+app.run(None)

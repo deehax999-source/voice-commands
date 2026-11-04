@@ -1,0 +1,62 @@
+# Maintainer: deehax999-source
+pkgname=voice-commands
+pkgver=1.13.0
+pkgrel=1
+pkgdesc="Unofficial voice commands for Claude Code, not affiliated with Anthropic (AI-generated personal project)"
+arch=(any)
+url="https://github.com/deehax999-source/voice-commands"
+license=(MIT)
+depends=(bash bubblewrap curl gtk4-layer-shell imagemagick jq libadwaita libnotify pipewire python
+         python-cairo python-gobject whisper-cpp xdg-utils xdotool xorg-server-xvfb zenity)
+optdepends=('claude-code: carries out the voice commands, unless Claude Code is installed another way'
+            'ttf-jetbrains-mono: the font of the windows, otherwise the system monospace font'
+            'wl-clipboard: copy buttons in the response window on Wayland'
+            'xclip: copy buttons in the response window on X11'
+            'claude-desktop: continue a session in the desktop app'
+            'piper-tts: more natural voice for reading responses aloud'
+            'speech-dispatcher: system voice for reading responses aloud')
+install=voice-commands.install
+source=(voice-commands
+        voice-commands-bg
+        voice-commands-permission
+        voice-commands-overlay
+        voice-commands-setup
+        voice-commands-window
+        voice-commands-markdown
+        voice-commands-speak
+        voice-commands-shortcuts
+        voice-commands-ask
+        voice-commands-theme
+        voice-commands-input
+        voice-commands-commands
+        voice-commands.lua
+        local.voicecommands.VoiceCommands.desktop
+        voice-commands.svg
+        SKILL.md
+        help-de.md
+        help-en.md
+        welcome.de.md
+        welcome.en.md
+        README.md
+        LICENSE)
+sha256sums=()
+
+package() {
+    local f
+    for f in voice-commands voice-commands-bg voice-commands-permission voice-commands-overlay voice-commands-setup voice-commands-window voice-commands-markdown voice-commands-speak voice-commands-shortcuts voice-commands-ask voice-commands-theme voice-commands-input voice-commands-commands; do
+        install -Dm755 "$f" "$pkgdir/usr/bin/$f"
+    done
+    install -Dm644 voice-commands.lua "$pkgdir/usr/share/voice-commands/hypr/voice-commands.lua"
+    install -Dm644 local.voicecommands.VoiceCommands.desktop "$pkgdir/usr/share/applications/local.voicecommands.VoiceCommands.desktop"
+    install -Dm644 voice-commands.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/voice-commands.svg"
+    install -Dm644 SKILL.md "$pkgdir/usr/share/voice-commands/skill/SKILL.md"
+    install -Dm644 help-de.md "$pkgdir/usr/share/voice-commands/help/de.md"
+    install -Dm644 help-en.md "$pkgdir/usr/share/voice-commands/help/en.md"
+    install -Dm644 welcome.de.md "$pkgdir/usr/share/voice-commands/help/welcome.de.md"
+    install -Dm644 welcome.en.md "$pkgdir/usr/share/voice-commands/help/welcome.en.md"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/voice-commands/README.md"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/voice-commands/LICENSE"
+    # Background programs run with the home folder as an overlay, which needs this kernel module
+    install -dm755 "$pkgdir/usr/lib/modules-load.d"
+    echo overlay >"$pkgdir/usr/lib/modules-load.d/voice-commands.conf"
+}
