@@ -31,10 +31,11 @@ for ext in db files; do
     cp --remove-destination "$OUT/$DB.$ext.tar.gz" "$OUT/$DB.$ext"
 done
 
-if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-    gh release create "$TAG" --repo "$REPO" --latest=false --title "pacman repository" \
-        --notes "The pacman repository of Voice Commands. Add it as described in the README under Installation; you do not need to download these files yourself."
-fi
+# The tag stays "repo", because pacman.conf names it; the title shows the version
+VERSION=$(sed -n 's/^pkgver=//p' packaging/PKGBUILD)
+NOTES="Voice Commands $VERSION in its pacman repository. Add the repository as described in the README under Installation; you do not need to download these files yourself. What changed is in CHANGELOG.md."
+gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 ||
+    gh release create "$TAG" --repo "$REPO" --title "Voice Commands $VERSION" --notes "$NOTES"
 old=$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' | grep '\.pkg\.tar\.zst$' | grep -vxF "$PKG" || true)
 # The package first and the database last, so that the database never names a missing package
 gh release upload "$TAG" --repo "$REPO" --clobber "$OUT/$PKG"
@@ -43,4 +44,6 @@ gh release upload "$TAG" --repo "$REPO" --clobber "$OUT/$DB.db"
 for name in $old; do
     gh release delete-asset "$TAG" "$name" --repo "$REPO" --yes
 done
+# Renamed only now, so that a failed upload does not show a version that is not there
+gh release edit "$TAG" --repo "$REPO" --title "Voice Commands $VERSION" --notes "$NOTES" >/dev/null
 echo "Published $PKG in the repository $DB."
