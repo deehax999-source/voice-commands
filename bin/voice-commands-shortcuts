@@ -600,14 +600,25 @@ used() {
 }
 
 CAPTURE="voice-commands-capture"
+CAPTURE_TOKEN="${XDG_RUNTIME_DIR:-/tmp}/voice-commands/capture.token"
+# The desktop's shortcuts come back on by themselves after 25 seconds, even if the window closes without
+# stopping. Each capture has its own token, so that the timer of an earlier one cannot end a later one.
+capture_timer() {
+    local token="$$.$RANDOM"
+    mkdir -p "$(dirname -- "$CAPTURE_TOKEN")" && printf '%s\n' "$token" >"$CAPTURE_TOKEN"
+    setsid -f "$(realpath -- "${BASH_SOURCE[0]}")" capture expire "$token" >/dev/null 2>&1 </dev/null
+}
 capture() {
+    if [ "$1" = expire ]; then
+        sleep 25
+        [ "$(cat "$CAPTURE_TOKEN" 2>/dev/null)" = "${2:-}" ] || return 0
+        capture stop
+        return
+    fi
+    [ "$1" != stop ] || rm -f "$CAPTURE_TOKEN"
     if [ "$(desktop)" = kde ]; then
         case "$1" in
-            start)
-                kde block on || return 1
-                # Back on by itself, even if the window closes without stopping
-                setsid -f sh -c "sleep 25; gdbus call -e -d org.kde.kglobalaccel -o /kglobalaccel -m org.kde.KGlobalAccel.blockGlobalShortcuts false" \
-                    >/dev/null 2>&1 </dev/null ;;
+            start) kde block on || return 1; capture_timer ;;
             stop) kde block off ;;
         esac
         return
@@ -619,8 +630,9 @@ capture() {
         start)
             # Needs the Lua settings; a mode needs one bind to exist, so it gets a key no keyboard has
             hyprctl eval "hl.define_submap(\"$CAPTURE\", function() hl.bind(\"XF86Launch9\", hl.dsp.submap(\"reset\")) end)" >/dev/null 2>&1 || return 1
-            hyprctl eval "hl.timer(function() if hl.get_current_submap() == \"$CAPTURE\" then hl.dispatch(hl.dsp.submap(\"reset\")) end end, { timeout = 25000, type = \"oneshot\" }) hl.dispatch(hl.dsp.submap(\"$CAPTURE\"))" >/dev/null 2>&1
-            [ "$(hyprctl submap 2>/dev/null)" = "$CAPTURE" ] ;;
+            hyprctl eval "hl.dispatch(hl.dsp.submap(\"$CAPTURE\"))" >/dev/null 2>&1
+            [ "$(hyprctl submap 2>/dev/null)" = "$CAPTURE" ] || return 1
+            capture_timer ;;
         stop)
             [ "$(hyprctl submap 2>/dev/null)" = "$CAPTURE" ] || return 0
             hyprctl eval 'hl.dispatch(hl.dsp.submap("reset"))' >/dev/null 2>&1 ;;
@@ -631,7 +643,7 @@ case "${1:-}" in
     desktop) desktop ;;
     info) info ;;
     write) write ;;
-    capture) capture "${2:-}" ;;
+    capture) capture "${2:-}" "${3:-}" ;;
     used) used "${2:-}" "${3:-0}" ;;
     check) check ;;
     show) show "${2:-toggle}" ;;

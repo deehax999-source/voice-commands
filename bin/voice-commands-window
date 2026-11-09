@@ -4,6 +4,7 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -44,7 +45,9 @@ _loader = SourceFileLoader("voice_commands_commands", str(BIN / "voice-commands-
 COMMANDS = importlib.util.module_from_spec(importlib.util.spec_from_loader(_loader.name, _loader))
 _loader.exec_module(COMMANDS)
 WORK = Path.home() / "Voice-Commands"
-HISTORY = WORK / "antworten.jsonl"
+# The history, outside the working folder so that Claude and background programs cannot change it unasked
+HISTORY = Path.home() / ".local/share/voice-commands/antworten.jsonl"
+OLD_HISTORY = WORK / "antworten.jsonl"
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
 MODEL_FILE = CONFIG_HOME / "voice-commands" / "model"
 SETTINGS_FILE = CONFIG_HOME / "voice-commands" / "settings.json"
@@ -54,14 +57,6 @@ SPEAK_PID = Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp") / "voice-commands"
 MAX_ENTRIES = 50
 # The first choice uses whatever is the default in Claude Code
 MODELS = ["", "haiku", "sonnet", "opus"]
-
-
-def system_language():
-    for name in ("VOICE_COMMANDS_LANG", "LC_ALL", "LC_MESSAGES", "LANG"):
-        value = os.environ.get(name)
-        if value:
-            return value.split("_")[0].split(".")[0].split("@")[0].lower()
-    return "en"
 
 
 TEXT = {
@@ -340,7 +335,7 @@ TEXT = {
                     "toggle_special": "special workspace", "window": "window action", "exit": "quit Hyprland",
                     "function": "a function of your own in your settings"}},
 }
-LABELS = TEXT.get(system_language(), TEXT["en"])
+LABELS = TEXT.get(THEME.language(), TEXT["en"])
 
 
 def load_model():
@@ -728,7 +723,7 @@ def shortcuts_group(dialog, window):
         problems = shortcut_problems()
         message = LABELS["banner"].format(problems=", ".join(problems)) if problems else LABELS["shortcut_saved"]
         dialog.add_toast(Adw.Toast(title=message, timeout=6 if problems else 2))
-        window.check_shortcuts()
+        window.recheck()
         # Hints naming shortcuts, in the settings and in the empty overview
         if hasattr(dialog, "show_shortcuts"):
             dialog.show_shortcuts()
@@ -781,7 +776,7 @@ WELCOME_SHOWN = CONFIG_HOME / "voice-commands" / "welcome-shown"
 
 def help_text(name):
     """Markdown help in the system language, with the current shortcuts filled in."""
-    language = "de" if system_language() == "de" else "en"
+    language = "de" if THEME.language() == "de" else "en"
     for candidate in (f"{name}.{language}.md" if name else f"{language}.md", f"{name}.en.md" if name else "en.md"):
         try:
             text = (HELP_DIR / candidate).read_text(encoding="utf-8")
@@ -811,10 +806,22 @@ def markdown_view(markdown):
 def help_dialog(window):
     dialog = Adw.Dialog(title=LABELS["help"], content_width=680, content_height=720)
     scroller = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
-    text = markdown_view(help_text(""))
+    markdown = help_text("")
+    text = markdown_view(markdown)
     scroller.set_child(text)
+    header = Adw.HeaderBar()
+    # Reads the help aloud like a response; a second click or closing the help stops it
+    reader = Gtk.Button(icon_name="audio-volume-high-symbolic", tooltip_text=LABELS["read"])
+    reader.update_property([Gtk.AccessibleProperty.LABEL], [LABELS["read"]])
+    if getattr(window, "can_speak", False) and markdown:
+        reader.connect("clicked", Reader.toggle, markdown)
+    else:
+        reader.set_sensitive(False)
+        reader.set_tooltip_text(LABELS["read_missing"])
+    header.pack_start(reader)
+    dialog.connect("closed", lambda _dialog: Reader.stop() if Reader.button is reader else None)
     view = Adw.ToolbarView()
-    view.add_top_bar(Adw.HeaderBar())
+    view.add_top_bar(header)
     view.set_content(scroller)
     dialog.set_child(view)
     dialog.present(window)
@@ -958,21 +965,14 @@ def folders_group(dialog):
         if not path:
             return
         path = os.path.realpath(path)
-        if path == "/":
+        warning = share_warning(path)
+        if warning == "root":
             tell(dialog, LABELS["folders"], LABELS["folder_root"])
-            return
-        home = os.path.realpath(Path.home())
-        # Home and everything above or beside it hold settings and private data of all kinds
-        if path == home or home.startswith(path + "/") or path in ("/etc", "/usr", "/var", "/mnt", "/media", "/run"):
-            warn(LABELS["folder_wide_title"], LABELS["folder_wide_body"].format(path=pretty_path(path)),
+        elif warning:
+            warn(LABELS[f"folder_{warning}_title"], LABELS[f"folder_{warning}_body"].format(path=pretty_path(path)),
                  LABELS["folder_wide_ok"], lambda: add_folder(path))
-            return
-        # Hidden folders in home, such as ~/.config, hold settings, logins and keys
-        if path.startswith(home + "/") and path[len(home) + 1:].startswith("."):
-            warn(LABELS["folder_hidden_title"], LABELS["folder_hidden_body"].format(path=pretty_path(path)),
-                 LABELS["folder_wide_ok"], lambda: add_folder(path))
-            return
-        add_folder(path)
+        else:
+            add_folder(path)
 
     def choose():
         chooser = Gtk.FileDialog(title=LABELS["folder_add"].rstrip(" …"))
@@ -980,6 +980,21 @@ def folders_group(dialog):
 
     show()
     return group
+
+
+def share_warning(path, home=None):
+    """Why sharing this folder needs a warning: "root" (never allowed), "wide" (home, a folder containing it
+    or a system folder) or "hidden" (a hidden folder in home, such as ~/.config); None for an ordinary folder."""
+    home = home or os.path.realpath(Path.home())
+    if path == "/":
+        return "root"
+    if path == home or home.startswith(path + "/"):
+        return "wide"
+    if path.startswith(home + "/"):
+        return "hidden" if path[len(home) + 1:].startswith(".") else None
+    # Outside home everything is a system folder, except folders on drives mounted below these
+    drives = ("/mnt", "/media", "/run/media")
+    return None if any(path.startswith(drive + "/") for drive in drives) else "wide"
 
 
 def custom_folders_dialog(parent, name):
@@ -1025,19 +1040,14 @@ def custom_folders_dialog(parent, name):
         if not path:
             return
         path = os.path.realpath(path)
-        if path == "/":
+        warning = share_warning(path)
+        if warning == "root":
             tell(dialog, LABELS["scope_folders"].format(name=name), LABELS["folder_root"])
-            return
-        home = os.path.realpath(Path.home())
-        if path == home or home.startswith(path + "/") or path in ("/etc", "/usr", "/var", "/mnt", "/media", "/run"):
-            warn(LABELS["folder_wide_title"], LABELS["folder_wide_body"].format(path=pretty_path(path)),
+        elif warning:
+            warn(LABELS[f"folder_{warning}_title"], LABELS[f"folder_{warning}_body"].format(path=pretty_path(path)),
                  lambda: add(path))
-            return
-        if path.startswith(home + "/") and path[len(home) + 1:].startswith("."):
-            warn(LABELS["folder_hidden_title"], LABELS["folder_hidden_body"].format(path=pretty_path(path)),
-                 lambda: add(path))
-            return
-        add(path)
+        else:
+            add(path)
 
     def choose():
         chooser = Gtk.FileDialog(title=LABELS["commands_folder_add"].rstrip(" …"))
@@ -1144,7 +1154,7 @@ def reach_controls(dialog, name):
 def commands_group(dialog):
     """Commands Claude may run without asking. voice-commands-commands decides with the same lists."""
     group = Adw.PreferencesGroup(title=LABELS["commands_title"], description=LABELS["commands_sub"])
-    german = system_language() == "de"
+    german = THEME.language() == "de"
 
     def set_off(name, on):
         off = COMMANDS.turned_off(load_settings())
@@ -1564,7 +1574,31 @@ class Reader:
         cls.button = None
 
 
+def well_formed(entry):
+    """True for an entry as voice-commands writes it. Only the fields are checked, not what the response says."""
+    texts = ("zeit", "befehl", "antwort", "sitzung")
+    files = entry.get("dateien", []) if isinstance(entry, dict) else None
+    return (isinstance(entry, dict) and all(isinstance(entry.get(key, ""), str) for key in texts)
+            and isinstance(files, list) and all(isinstance(path, str) for path in files))
+
+
+def move_old_history():
+    """Moves the history from its old place in the working folder, under the lock voice-commands also takes."""
+    if HISTORY.exists() or not OLD_HISTORY.is_file() or OLD_HISTORY.is_symlink():
+        return
+    try:
+        HISTORY_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        HISTORY.parent.mkdir(parents=True, exist_ok=True)
+        with open(HISTORY_LOCK, "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if not HISTORY.exists():
+                shutil.move(OLD_HISTORY, HISTORY)
+    except OSError:
+        pass
+
+
 def load_entries():
+    move_old_history()
     if not HISTORY.exists():
         return []
     entries = []
@@ -1573,7 +1607,7 @@ def load_entries():
             entry = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(entry, dict):
+        if well_formed(entry):
             entry["_line"] = line
             entries.append(entry)
     return list(reversed(entries))
@@ -1881,9 +1915,9 @@ def build_entry(entry, can_speak, window):
         reader.set_tooltip_text(LABELS["read_missing"])
     actions.append(reader)
     actions.append(Gtk.Box(hexpand=True))
-    session = entry.get("sitzung", "")
+    session = session_of(entry)
     # Only while Claude Code still has the conversation
-    if re.fullmatch(r"[0-9a-fA-F-]{36}", session) and (SESSIONS / f"{session}.jsonl").exists():
+    if session:
         desktop = action_button("window-new-symbolic", LABELS["desktop"], LABELS["desktop_tip"])
         desktop.connect("clicked", open_in_desktop, session)
         actions.append(desktop)
@@ -1955,7 +1989,7 @@ class Window(Adw.ApplicationWindow):
         keys = Gtk.EventControllerKey()
         keys.connect("key-pressed", self.on_key)
         self.add_controller(keys)
-        self.refresh()
+        self.can_speak = False
 
     def on_key(self, _ctrl, keyval, _code, _state):
         if keyval == Gdk.KEY_Escape:
@@ -2100,17 +2134,20 @@ class Window(Adw.ApplicationWindow):
             self.banner.set_title(LABELS["banner"].format(problems=", ".join(problems)))
         self.banner.set_revealed(bool(problems))
 
-    def refresh(self):
+    def recheck(self):
+        """Asks the helpers about shortcuts and voices; slower than a refresh, so only on opening and applying."""
         self.check_shortcuts()
+        self.can_speak = speech_engine() != "none"
+
+    def refresh(self):
         while (child := self.list.get_first_child()) is not None:
             self.list.remove(child)
         Reader.button = None
         entries = load_entries()
-        can_speak = speech_engine() != "none"
         if not entries:
             self.list.append(empty_state())
         for entry in entries:
-            self.list.append(build_entry(entry, can_speak, self))
+            self.list.append(build_entry(entry, self.can_speak, self))
         GLib.timeout_add(300, self.make_selectable)
 
     def make_selectable(self):
@@ -2126,6 +2163,7 @@ def on_activate(app):
         THEME.apply()
         app.themed = True
     window = app.get_active_window() or Window(app)
+    window.recheck()
     window.refresh()
     window.present()
     show_welcome_once(window)

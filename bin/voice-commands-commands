@@ -111,7 +111,7 @@ def risk(text):
             return kind
     return None
 # Characters that would make the shell do more than run one command with these words
-SHELL_SPECIAL = set(";&|`$()<>{}\\\n\r!")
+SHELL_SPECIAL = set(";&|`$()<>{}\\\n\r!#^")  # # and ^ are wildcards with zsh's extendedglob
 GLOB = set("*?[")
 
 
@@ -345,10 +345,19 @@ def paths_of(argument, cwd):
     if argument.startswith("~") and not (argument == "~" or argument.startswith("~/")):
         return None  # ~user
     found = [resolve(argument, cwd)]
+    # Hidden files too: with zsh's globdots, * also matches them
     if GLOB & set(argument):
         pattern = os.path.join(cwd, os.path.expanduser(argument))
-        found += [os.path.realpath(match) for match in glob.glob(pattern, recursive=True)]
+        found += [os.path.realpath(match) for match in glob.glob(pattern, recursive=True, include_hidden=True)]
     return found
+
+
+def attached(argument, cwd):
+    """The path an option names with its value attached, as in -f.env or --file=.env, so that the check
+    for places with secrets sees it too. Other options give a harmless path in the current folder."""
+    value = argument.split("=", 1)[1] if argument.startswith("--") and "=" in argument else (
+        "" if argument.startswith("--") else argument[2:])
+    return [resolve(value, cwd)] if value else []
 
 
 def check(command, cwd):
@@ -361,13 +370,16 @@ def check(command, cwd):
     off = turned_off(settings)
 
     if name in SYSTEM_INFO and name not in off:
-        # Options and plain numbers only: no file can be named
+        # Options and plain numbers only: no file can be named, except in the current folder as in date -f.env
+        named = []
         for argument in arguments:
             if GLOB & set(argument) or "/" in argument or "~" in argument:
                 return None
             if not (argument[:1] in "-+" or argument.isdigit()):
                 return None
-        return []
+            if argument.startswith("-"):
+                named += attached(argument, cwd)
+        return named
 
     if name in WORK_FILES and name not in off:
         return within_reach(name, arguments, cwd, settings, WORK_FORBIDDEN.get(name, set()))
@@ -380,6 +392,7 @@ def check(command, cwd):
             named = []
             for argument in arguments:
                 if argument.startswith("-"):
+                    named += attached(argument, cwd)
                     # A path can follow "=" or stick to a short option, as in -f~/.ssh/key
                     if "=" in argument:
                         value = argument.split("=", 1)[1]
@@ -408,6 +421,7 @@ def within_reach(name, arguments, cwd, settings, forbidden):
             option = argument.split("=", 1)[0]
             if option in forbidden or option == "--files0-from" or "/" in argument or "~" in argument:
                 return None
+            named += attached(argument, cwd)
             continue
         found = paths_of(argument, cwd)
         if found is None or not all(reaches(scope, path, name, settings) for path in found):

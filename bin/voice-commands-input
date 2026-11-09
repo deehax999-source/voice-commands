@@ -15,14 +15,6 @@ from pathlib import Path
 BIN = Path(os.path.realpath(__file__)).parent
 
 
-def language():
-    for name in ("VOICE_COMMANDS_LANG", "LC_ALL", "LC_MESSAGES", "LANG"):
-        value = os.environ.get(name)
-        if value:
-            return value.split("_")[0].split(".")[0].split("@")[0].lower()
-    return "en"
-
-
 TEXT = {
     "de": {"title": "Befehl eingeben", "question": "Was soll Claude tun?",
            "hint": "Enter sendet, Shift+Enter beginnt eine neue Zeile, Esc schließt.",
@@ -31,7 +23,6 @@ TEXT = {
            "hint": "Enter sends, Shift+Enter starts a new line, Esc closes.",
            "send": "Send", "cancel": "Cancel"},
 }
-LABELS = TEXT.get(language(), TEXT["en"])
 
 
 def detach():
@@ -54,6 +45,7 @@ def main():
     loader = SourceFileLoader("voice_commands_theme", str(BIN / "voice-commands-theme"))
     theme = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
     loader.exec_module(theme)
+    LABELS = TEXT.get(theme.language(), TEXT["en"])
 
     def activate(app):
         # A second press of the shortcut brings the open window to the front

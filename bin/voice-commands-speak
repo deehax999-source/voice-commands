@@ -10,7 +10,7 @@ set -u
 RUN="${XDG_RUNTIME_DIR:-/tmp}/voice-commands"
 VOICES="$HOME/.local/share/voice-commands/voices"
 PID_FILE="$RUN/speak.pid"
-SPEAK_WAV=""
+SPEAK_DIR=""
 mkdir -p "$RUN"
 
 stop() {
@@ -38,16 +38,16 @@ system_voice() {
 # The AUR package piper-tts installs "piper-tts". "pipx install piper-tts" installs "piper" in
 # ~/.local/bin, which is often not in PATH when a shortcut starts Voice Commands. Older packages call
 # it "piper" too, which is also the name of an unrelated program for gaming mice, so a "piper" must
-# show Piper's options.
-piper_command() {
+# show Piper's options. Sets PIPER and PIPER_HELP, so that reading asks Piper for its options only once.
+PIPER="" PIPER_HELP=""
+find_piper() {
     local candidate
-    if command -v piper-tts >/dev/null; then
-        echo piper-tts
-        return 0
-    fi
-    for candidate in "$(command -v piper)" "$HOME/.local/bin/piper"; do
-        if [ -n "$candidate" ] && [ -x "$candidate" ] && timeout 10 "$candidate" --help 2>&1 | grep -q -- '--model'; then
-            echo "$candidate"
+    [ -z "$PIPER" ] || return 0
+    for candidate in "$(command -v piper-tts)" "$(command -v piper)" "$HOME/.local/bin/piper"; do
+        [ -n "$candidate" ] && [ -x "$candidate" ] || continue
+        PIPER_HELP="$(timeout 10 "$candidate" --help 2>&1)"
+        if [[ "$candidate" == */piper-tts || "$PIPER_HELP" == *--model* ]]; then
+            PIPER="$candidate"
             return 0
         fi
     done
@@ -57,7 +57,7 @@ piper_command() {
 piper_voice() { [ -s "$VOICES/$1.onnx" ] && [ -s "$VOICES/$1.onnx.json" ] && echo "$VOICES/$1.onnx"; }
 
 engine() {
-    if piper_command >/dev/null && { piper_voice de >/dev/null || piper_voice en >/dev/null; }; then
+    if find_piper && { piper_voice de >/dev/null || piper_voice en >/dev/null; }; then
         echo piper
     elif system_voice >/dev/null; then
         echo system
@@ -87,40 +87,66 @@ play() {
     done
 }
 
+# Splits the text into pieces of whole sentences of about 400 characters, one per line, so that reading
+# starts after the first piece instead of after the whole text
+pieces() {
+    printf '%s\n' "$1" | sed -E 's/([.!?:;]) +/\1\n/g' | awk '
+        length($0) == 0 { next }
+        length(piece) > 0 && length(piece) + length($0) > 400 { print piece; piece = "" }
+        { piece = length(piece) ? piece " " $0 : $0 }
+        END { if (length(piece)) print piece }'
+}
+
 speak_piper() {
-    local text="$1" language="$2" factor="$3" voice wav help options=() piper
-    piper="$(piper_command)" || return 1
+    local text="$1" language="$2" factor="$3" voice wav piece player="" number=0 options=()
+    find_piper || return 1
     voice="$(piper_voice "$language")" || voice="$(piper_voice de)" || voice="$(piper_voice en)" || return 1
-    wav="$(mktemp "$RUN/speak.XXXXXX.wav")"
-    SPEAK_WAV="$wav"
-    trap 'rm -f "$SPEAK_WAV"' EXIT TERM
+    SPEAK_DIR="$(mktemp -d "$RUN/speak.XXXXXX")"
+    # Stopping ends the reader too: a trap that only removed the files let the system voice read the text again
+    trap 'rm -rf "$SPEAK_DIR"' EXIT
+    trap 'exit 0' TERM
     # The newer Piper writes --length-scale, the older one --length_scale
-    help="$("$piper" --help 2>&1)"
-    case "$help" in
+    case "$PIPER_HELP" in
         *--length-scale*) options=(--length-scale "$factor") ;;
         *--length_scale*) options=(--length_scale "$factor") ;;
     esac
-    printf '%s\n' "$text" | "$piper" -m "$voice" -f "$wav" "${options[@]}" >/dev/null 2>&1 || return 1
-    play "$wav"
+    # Each piece is made while the one before it plays
+    while IFS= read -r piece; do
+        number=$((number + 1))
+        wav="$SPEAK_DIR/$number.wav"
+        if ! printf '%s\n' "$piece" | "$PIPER" -m "$voice" -f "$wav" "${options[@]}" >/dev/null 2>&1; then
+            # Only the first piece falls back to the system voice; later the text is already half read
+            [ "$number" = 1 ] && return 1
+            break
+        fi
+        [ -z "$player" ] || wait "$player"
+        play "$wav" &
+        player=$!
+    done < <(pieces "$text")
+    [ -z "$player" ] || wait "$player"
+    [ "$number" -gt 0 ]
 }
 
 speak_system() {
-    local text="$1" language="$2" rate="$3"
+    local text="$1" language="$2" rate="$3" limit
+    # A limit in case the voice hangs, long enough for long texts such as the help (about 15 characters a second)
+    limit=$(( 300 + ${#text} / 10 ))
     case "$(system_voice)" in
-        spd-say) timeout 300 spd-say --wait -l "$language" -r "$rate" -- "$text" ;;
-        espeak-ng) timeout 300 espeak-ng -v "$language" -s $(( 175 + rate * 175 / 100 )) -- "$text" ;;
+        spd-say) timeout "$limit" spd-say --wait -l "$language" -r "$rate" -- "$text" ;;
+        espeak-ng) timeout "$limit" espeak-ng -v "$language" -s $(( 175 + rate * 175 / 100 )) -- "$text" ;;
     esac
 }
 
 case "${1:-normal}" in
     stop) stop; exit ;;
     engine) engine; exit 0 ;;
-    piper) piper_command; exit ;;
+    piper) find_piper && echo "$PIPER"; exit ;;
     __read)
-        # Internal: the actual reading, in its own process group so that "stop" also ends the player
+        # Internal: the actual reading, in its own process group so that "stop" also ends the player. It
+        # looks for a voice itself, which can take seconds, so that stopping works meanwhile too.
         echo $$ >"$PID_FILE"
-        kind="$2" language="$3" factor="$4" rate="$5" text="$6"
-        if [ "$kind" != piper ] || ! speak_piper "$text" "$language" "$factor"; then
+        language="$2" factor="$3" rate="$4" text="$5"
+        if ! speak_piper "$text" "$language" "$factor"; then
             speak_system "$text" "$language" "$rate"
         fi
         [ "$(cat "$PID_FILE" 2>/dev/null)" != $$ ] || rm -f "$PID_FILE"
@@ -133,6 +159,6 @@ esac
 text="$(cat)"
 [ -n "${text//[[:space:]]/}" ] || exit 0
 stop
-kind="$(engine)"
-[ "$kind" != none ] || exit 1
-setsid "$0" __read "$kind" "$(language_of "$text")" "$factor" "$rate" "$text" </dev/null >/dev/null 2>&1 &
+setsid "$0" __read "$(language_of "$text")" "$factor" "$rate" "$text" </dev/null >/dev/null 2>&1 &
+# Noted at once, so that a stop right after this finds the reader; the reader notes itself again
+echo $! >"$PID_FILE"

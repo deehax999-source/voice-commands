@@ -5,6 +5,9 @@
 set -euo pipefail
 
 cd "$(dirname "$(readlink -f "$0")")/.."
+for tool in updpkgsums makepkg; do
+    command -v "$tool" >/dev/null || { echo "$tool is missing. Install it with: sudo pacman -S --needed pacman-contrib base-devel" >&2; exit 1; }
+done
 
 OUT="${1:-aur}"
 mkdir -p "$OUT"

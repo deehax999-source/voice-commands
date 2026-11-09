@@ -87,6 +87,7 @@ PROTECTED_PLACES=(
     .config/Code\ -\ OSS .config/zed .config/helix .tmux.conf .config/tmux .screenrc .config/kitty
     .config/alacritty .config/foot .config/wezterm .wezterm.lua .config/ghostty .config/konsolerc
     .local/share/konsole .config/xfce4/terminal .config/fontconfig .config/qutebrowser
+    .config/quickshell .config/noctalia .config/waybar .local/share/voice-commands
 )
 
 protected() {
@@ -257,6 +258,7 @@ text_for() {
             secrets) echo "Hier können Passwörter oder Schlüssel liegen. Inhalte daraus könnten an Anthropic gesendet werden." ;;
             outside) echo "Das liegt außerhalb deines Home-Ordners." ;;
             protected) echo "Das liegt in einem freigegebenen Ordner, aber Änderungen hier können Programme starten oder Claudes Rechte ändern. Deshalb fragt Voice Commands trotzdem." ;;
+            history) echo "Das ist der Verlauf des Antwortfensters. Ihn schreibt Voice Commands selbst, Claude muss ihn nicht ändern." ;;
             read_note) echo "Der Inhalt würde an Anthropic gesendet." ;;
             all_warning) printf '%s\n\n%s\n%s\n%s\n%s\n\n%s' \
                 "Bist du sicher? Bis zum Ende dieser Anfrage wirst du nicht mehr gefragt." \
@@ -292,6 +294,7 @@ text_for() {
             secrets) echo "This place can contain passwords or keys. Its content could be sent to Anthropic." ;;
             outside) echo "This is outside your home folder." ;;
             protected) echo "This is in a shared folder, but changes here can start programs or change what Claude may do. That is why Voice Commands asks anyway." ;;
+            history) echo "This is the history of the response window. Voice Commands writes it itself, Claude has no need to change it." ;;
             read_note) echo "Its content would be sent to Anthropic." ;;
             all_warning) printf '%s\n\n%s\n%s\n%s\n%s\n\n%s' \
                 "Are you sure? You will not be asked again until this request ends." \
@@ -365,6 +368,8 @@ case "$tool" in
         if [ "$tool" = Write ] && [ ! -e "$target" ] && [ "$(dirname -- "$target")" = "$WORK" ]; then
             decide deny "Not saved: new files never go loosely into the top of the working folder. Save it in a subfolder by topic instead: look at the existing folders with Glob and use one that fits, otherwise write to a new, clearly named folder in the language of the command, such as $WORK/Rezepte/$(basename -- "$target"). Write creates the folder by itself."
         fi
+        # The history of the response window: a changed entry would look like a real response there
+        [ "$target" = "$HOME/.local/share/voice-commands/antworten.jsonl" ] && ask "$question" "$place" "$(text_for history)"
         inside "$target" "$WORK" && allow
         if shared "$target" write; then
             protected "$target" && ask "$question" "$place" "$(text_for protected)"
@@ -378,8 +383,11 @@ case "$tool" in
     Bash)
         command="$(field command)"
         # Only a plain call of the background tool goes through without asking. A program it starts gets
-        # no arguments but web addresses, because others could open local files (file://) or run commands
-        if [[ "$command" =~ ^voice-commands-bg([[:space:]]|$) ]] && [[ "$command" != *[\;\&\|\`\$\(\)\<\>]* ]] && [[ "$command" != *$'\n'* ]]; then
+        # no arguments but web addresses, because others could open local files (file://) or run commands.
+        # Braces and backslashes are refused too: the shell would turn {blender,--python,x.py} into arguments.
+        # So are quotes and wildcards: "start" or st''art would skip the check of the arguments below, and
+        # [b]lender or * could turn into other words through folder names Claude may create
+        if [[ "$command" =~ ^voice-commands-bg([[:space:]]|$) ]] && [[ "$command" != *[\;\&\|\`\$\(\)\<\>\{\}\\\"\'\*\?\[]* ]] && [[ "$command" != *$'\n'* ]]; then
             read -ra bg_words <<<"$command"
             bg_plain=1
             if [ "${bg_words[1]:-}" = start ]; then

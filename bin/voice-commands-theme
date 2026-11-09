@@ -109,6 +109,15 @@ button.vc-no {{ font-weight: 700; }}
 """
 
 
+def language():
+    """The language of the windows, such as de or en: VOICE_COMMANDS_LANG, otherwise the system's."""
+    for name in ("VOICE_COMMANDS_LANG", "LC_ALL", "LC_MESSAGES", "LANG"):
+        value = os.environ.get(name)
+        if value:
+            return value.split("_")[0].split(".")[0].split("@")[0].lower()
+    return "en"
+
+
 def palette(dark):
     return DARK if dark else LIGHT
 

@@ -1,10 +1,7 @@
 # Voice Commands: project notes for Claude
 
 > [!NOTE]
-> **About this file:** `CLAUDE.md` holds the instructions that Claude Code reads when it works on this project: its l
-ayout, the development mode and the design decisions that must stay. It is not a user guide. To install and use Voice
- Commands, read the [README](README.md). If you change the project with Claude Code yourself, Claude follows these no
-tes, so keep them up to date.
+> **About this file:** `CLAUDE.md` holds the instructions that Claude Code reads when it works on this project: its layout, the development mode and the design decisions that must stay. It is not a user guide. To install and use Voice Commands, read the [README](README.md). If you change the project with Claude Code yourself, Claude follows these notes, so keep them up to date.
 
 Spoken commands for Claude Code on Arch Linux. Talk to the user in their language, which is German.
 
@@ -19,7 +16,7 @@ Spoken commands for Claude Code on Arch Linux. Talk to the user in their languag
 - `tests/permission-hook.sh`: tests for the permission hook, the command lists and the protected area of background programs; run them after every change to any of them, and add a case for each new rule.
 - `help/`: help (`de.md`, `en.md`) and the short welcome shown when the response window opens for the first time (`welcome.de.md`, `welcome.en.md`). `{toggle}`, `{cancel}`, `{window}`, `{send}` and `{type}` are replaced by the current shortcuts. Keep both languages up to date whenever a feature changes.
 
-Runtime data is in `~/Voice-Commands`, speech models are in `~/.local/share/voice-commands`.
+Runtime data is in `~/Voice-Commands`, speech models and the history of the response window (`antworten.jsonl`, moved there from `~/Voice-Commands` so that Claude and background programs cannot change it unasked) are in `~/.local/share/voice-commands`.
 
 ## Development mode
 

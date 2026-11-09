@@ -66,22 +66,17 @@ if "$BINDIR/voice-commands-speak" piper >/dev/null 2>&1; then
     # German and English, because Claude answers in the language of the command
     VOICES="$HF/rhasspy/piper-voices/resolve/$PIPER_REV"
     mkdir -p "$MODEL_DIR/voices"
-    # fetch_voice SHORT PATH DATASET SHA256_OF_ONNX SHA256_OF_JSON
+    # fetch_voice SHORT PATH SHA256_OF_ONNX SHA256_OF_JSON; a voice from an older version, such as the English
+    # voice with a research-only license, does not match the checksums and is downloaded again
     fetch_voice() {
-        local short="$1" path="$2" dataset="$3" sum_onnx="$4" sum_json="$5"
-        # A voice from an older version is replaced, for example the English voice with a research-only license
-        if [ -s "$MODEL_DIR/voices/$short.onnx.json" ] &&
-           [ "$(jq -r '.dataset // empty' "$MODEL_DIR/voices/$short.onnx.json" 2>/dev/null)" != "$dataset" ]; then
-            echo "Replacing the voice voices/$short.onnx with a new one."
-            rm -f "$MODEL_DIR/voices/$short.onnx" "$MODEL_DIR/voices/$short.onnx.json"
-        fi
+        local short="$1" path="$2" sum_onnx="$3" sum_json="$4"
         fetch_model "voices/$short.onnx" "$VOICES/$path.onnx" "$sum_onnx" || true
         fetch_model "voices/$short.onnx.json" "$VOICES/$path.onnx.json" "$sum_json" || true
     }
-    fetch_voice de de/de_DE/thorsten/medium/de_DE-thorsten-medium thorsten \
+    fetch_voice de de/de_DE/thorsten/medium/de_DE-thorsten-medium \
         7e64762d8e5118bb578f2eea6207e1a35a8e0c30595010b666f983fc87bb7819 \
         974adee790533adb273a1ac88f49027d2a1b8f0f2cf4905954a4791e79264e85
-    fetch_voice en en/en_US/ljspeech/medium/en_US-ljspeech-medium ljspeech \
+    fetch_voice en en/en_US/ljspeech/medium/en_US-ljspeech-medium \
         6f52a751e2349abe7a76735eb09dc1875298c77ea2342ffd2fef79ff81b87f22 \
         141d612cc0a95ed7efc1ca936b845c2364967f2e9217c5dbfcf69fc4d6c65860
 else
@@ -135,7 +130,7 @@ ln -sfn "$SHARE/skill" "$HOME/.claude/skills/voice-commands"
 echo "Claude now knows how to help with Voice Commands."
 
 step "Keyboard shortcuts"
-HYPR="$HOME/.config/hypr"
+HYPR="${XDG_CONFIG_HOME:-$HOME/.config}/hypr"
 shortcuts_added=1
 desktop="$("$BINDIR/voice-commands-shortcuts" desktop)"
 # Plasma and GNOME get their shortcuts through their own shortcut settings, Hyprland through a file it

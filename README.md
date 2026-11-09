@@ -258,9 +258,9 @@ Then remove these by hand:
 - on GNOME, the shortcuts "Voice Commands: ..." in the settings under Keyboard, View and Customize Shortcuts, Custom Shortcuts
 - on other desktops, the keyboard shortcuts you added
 - the link `~/.claude/skills/voice-commands`
-- the speech recognition files and voices in `~/.local/share/voice-commands`
+- the speech recognition files, voices and the last 50 responses in `~/.local/share/voice-commands`
 - the settings in `~/.config/voice-commands`
-- the response history, the log and any files Claude saved in `~/Voice-Commands`
+- the log and any files Claude saved in `~/Voice-Commands`
 - Claude Code's saved conversations of voice commands, in the folder for `~/Voice-Commands` under `~/.claude/projects` (named like `-home-<you>-Voice-Commands`); they are otherwise deleted only after the days set under Keep conversations
 - `/etc/modules-load.d/voice-commands.conf`, if you created it to run Voice Commands from the source folder (`sudo rm /etc/modules-load.d/voice-commands.conf`); the package's own file is removed with the package
 
@@ -305,9 +305,9 @@ Then remove these by hand:
 
 | Where | What |
 |---|---|
-| `~/Voice-Commands` | Claude's working folder: your files from Claude, `antworten.jsonl` (the last 50 responses), `log.txt` (the last 1000 lines) |
+| `~/Voice-Commands` | Claude's working folder: your files from Claude, `log.txt` (the last 1000 lines) |
 | `~/.config/voice-commands` | `settings.json` (settings and shortcuts), `model` (the chosen model), `shortcuts.lua` (Hyprland) |
-| `~/.local/share/voice-commands` | speech recognition files and voices |
+| `~/.local/share/voice-commands` | speech recognition files, voices, `antworten.jsonl` (the last 50 responses) |
 | `$XDG_RUNTIME_DIR/voice-commands` and `.../voice-commands-bg` | recording, queue, status, screenshots; in memory, gone at logout |
 | `~/.claude/projects/-home-<you>-Voice-Commands` | Claude Code's conversations of voice commands, deleted after the days set |
 | `~/.claude/skills/voice-commands` | instructions for Claude Code on updating Voice Commands |

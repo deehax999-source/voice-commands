@@ -59,14 +59,6 @@ def clock(seconds):
     return f"{seconds // 60}:{seconds % 60:02d}"
 
 
-def system_language():
-    for name in ("VOICE_COMMANDS_LANG", "LC_ALL", "LC_MESSAGES", "LANG"):
-        value = os.environ.get(name)
-        if value:
-            return value.split("_")[0].split(".")[0].split("@")[0].lower()
-    return "en"
-
-
 TEXT = {
     "de": {
         "recording": "Aufnahme  {time}",
@@ -85,7 +77,7 @@ TEXT = {
         "done": "finish", "send": "send now", "cancel": "cancel",
     },
 }
-LABELS = TEXT.get(system_language(), TEXT["en"])
+LABELS = TEXT.get(THEME.language(), TEXT["en"])
 
 
 def shortcut(action, fallback):

@@ -105,7 +105,7 @@ NEVER_PROGRAMS=(
     emacs emacsclient gvim vim nvim nvim-qt neovide code code-oss codium vscodium cursor zed zeditor kate
     geany gnome-builder idea pycharm clion webstorm goland rider phpstorm rubymine datagrip android-studio
     studio jetbrains-toolbox eclipse netbeans qtcreator kdevelop lapce helix hx sublime_text subl
-    dolphin krusader thunar mc doublecmd spacefm pcmanfm pcmanfm-qt nemo caja
+    dolphin nautilus krusader thunar mc doublecmd spacefm pcmanfm pcmanfm-qt nemo caja
     yakuake guake tilda terminator
 )
 
