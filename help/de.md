@@ -92,7 +92,7 @@ Andere Stimmen in der Nähe deines Mikrofons und fremde Daten in Programmen kön
 - **Die Tastenkürzel reagieren nicht:** Schau, ob oben im Fenster ein Warnstreifen steht. Führe sonst `voice-commands-setup` im Terminal aus.
 - **„Nichts erkannt“:** Prüfe das Mikrofon und sprich etwas länger. Unter **Gesprochene Sprache** kannst du die Sprache fest einstellen.
 - **Fehler bei Claude:** Die Details stehen in `~/Voice-Commands/log.txt`. Prüfe, ob Claude Code angemeldet ist, indem du einmal `claude` im Terminal startest.
-- **Hintergrundprogramme starten nicht:** Sie brauchen bubblewrap und das Kernelmodul `overlay`. Führe `voice-commands-setup` aus, es nennt, was fehlt. Meldet `sudo modprobe overlay`, das Modul sei nicht zu finden, wurde der Kernel seit dem letzten Start aktualisiert: Starte den Rechner neu.
+- **Hintergrundprogramme starten nicht:** Sie brauchen bubblewrap und das Kernelmodul `overlay`. Führe `voice-commands-setup` aus, es nennt, was fehlt. Meldet `sudo modprobe overlay` `FATAL: Module overlay not found`, wurde der Kernel seit dem letzten Start aktualisiert und die Module des alten gelöscht: Starte den Rechner neu. Das passiert oft direkt nach der Installation, wenn dabei auch ein neuer Kernel kam.
 - **Keine Stimme beim Vorlesen:** Installiere `piper-tts` aus dem AUR oder mit `pipx install piper-tts` (vorher `sudo pacman -S python-pipx`) und führe danach `voice-commands-setup` aus. Die pipx-Version aktualisierst du selbst mit `pipx upgrade piper-tts`.
 - **Hyprland zeigt eine Warnung zu Voice Commands:** Führe `voice-commands-setup` aus. Steht danach noch eine Warnung im Fenster, ändere das betroffene Tastenkürzel.
 

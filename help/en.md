@@ -92,7 +92,7 @@ Other voices near your microphone and other people's data in programs can also r
 - **The shortcuts do nothing:** Check whether a warning bar is shown at the top of this window. Otherwise, run `voice-commands-setup` in a terminal.
 - **"Nothing recognized":** Check the microphone and speak a little longer. Under **Spoken language**, you can set the language.
 - **Claude reports an error:** Details are in `~/Voice-Commands/log.txt`. Check that Claude Code is signed in by starting `claude` once in a terminal.
-- **Background programs do not start:** They need bubblewrap and the kernel module `overlay`. Run `voice-commands-setup`, which names what is missing. If `sudo modprobe overlay` says the module is not found, the kernel was updated since the last start: restart the computer.
+- **Background programs do not start:** They need bubblewrap and the kernel module `overlay`. Run `voice-commands-setup`, which names what is missing. If `sudo modprobe overlay` fails with `FATAL: Module overlay not found`, the kernel was updated since the last start and the old one's modules were deleted: restart the computer. This often happens right after the installation, when it brought a new kernel too.
 - **No voice for reading aloud:** Install `piper-tts` from the AUR or with `pipx install piper-tts` (first `sudo pacman -S python-pipx`), then run `voice-commands-setup`. Update the pipx version yourself with `pipx upgrade piper-tts`.
 - **Hyprland shows a warning about Voice Commands:** Run `voice-commands-setup`. If this window still shows a warning afterwards, change that shortcut.
 

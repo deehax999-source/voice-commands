@@ -1,13 +1,27 @@
 # Background programs need the kernel module overlay; from the next start of the computer on, it is
 # loaded by /usr/lib/modules-load.d/voice-commands.conf
 load_overlay() {
-    grep -qw overlay /proc/filesystems 2>/dev/null || modprobe overlay 2>/dev/null ||
-        echo "Voice Commands: could not load the kernel module overlay, probably because the kernel was updated since the last start; background programs work after a restart."
+    grep -qw overlay /proc/filesystems 2>/dev/null && return 0
+    modprobe overlay 2>/dev/null && return 0
+    # pacman deletes the modules of the old kernel when it installs a new one, so the running kernel
+    # finds none until the next start
+    if [ ! -d "/lib/modules/$(uname -r)" ]; then
+        echo "Voice Commands: IMPORTANT: the kernel was updated, but the computer still runs the old one."
+        echo "  Restart the computer before you use Voice Commands. Until then, background programs"
+        echo "  do not start, and 'sudo modprobe overlay' fails with 'FATAL: Module overlay not found'."
+    else
+        echo "Voice Commands: could not load the kernel module overlay, so background programs do not start."
+        echo "  Restart the computer; if that does not help, run voice-commands-setup, which names what is missing."
+    fi
+    return 1
 }
 
 post_install() {
-    load_overlay
-    echo "Voice Commands: To finish, run this once as your normal user: voice-commands-setup"
+    if load_overlay; then
+        echo "Voice Commands: To finish, run this once as your normal user: voice-commands-setup"
+    else
+        echo "Voice Commands: To finish, restart the computer, then run this once as your normal user: voice-commands-setup"
+    fi
 }
 
 post_upgrade() {

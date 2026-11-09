@@ -78,6 +78,9 @@ voice-commands-setup
 
 The package also makes the computer load the kernel module `overlay` at every start (`/usr/lib/modules-load.d/voice-commands.conf`), which the protected area for background programs needs, and loads it right away. `build-package.sh` also writes the checksums of the files into the package description; `packaging/PKGBUILD` in the repository has none on its own, so build with the script, not from that file directly. `makepkg -si` asks for your password and installs the missing dependencies. If pacman asks which of several packages to install, pressing Enter takes the default.
 
+> [!IMPORTANT]
+> If the first command updated the kernel, restart the computer before `voice-commands-setup`. pacman deletes the modules of the old kernel, and the computer keeps running the old one until the next start, so the kernel module `overlay` cannot be loaded: the installation says so, `voice-commands-setup` reports that the overlay is not loaded, and `sudo modprobe overlay` fails with `FATAL: Module overlay not found in directory /lib/modules/…`. After the restart it loads by itself.
+
 Run `voice-commands-setup` as your normal user, not with `sudo`, in a terminal of your desktop session, so that it can add the shortcuts.
 
 The setup downloads the speech recognition files, and the voices for reading aloud if Piper is installed. On Hyprland, KDE Plasma and GNOME, it also adds the keyboard shortcuts. On other desktops, it shows you the commands to add in your keyboard settings. It also finds Claude Code in `~/.local/bin` when that folder is not in your `PATH`. Anything still missing is listed at the end under "STILL TO DO".
@@ -219,7 +222,7 @@ More rules:
 - **Claude reports an error:** Details are in `~/Voice-Commands/log.txt`. Check that Claude Code is signed in by starting `claude` once in a terminal.
 - **No notifications:** Check that your desktop's do not disturb mode is off.
 - **No voice for reading aloud:** Install `piper-tts` from the AUR or with `pipx install piper-tts`, then run `voice-commands-setup` again.
-- **Background programs do not start:** They need bubblewrap and the kernel module `overlay`. Run `voice-commands-setup`, which names what is missing. If `sudo modprobe overlay` says the module is not found, the kernel was updated since the last start: restart the computer.
+- **Background programs do not start:** They need bubblewrap and the kernel module `overlay`. Run `voice-commands-setup`, which names what is missing. If `sudo modprobe overlay` fails with `FATAL: Module overlay not found`, the kernel was updated since the last start and its old modules were deleted: restart the computer. If it still fails after the restart, compare `uname -r` with the folders in `/lib/modules`; if the running kernel has no folder there, the computer starts an old kernel, so choose the new one in the boot menu or update the boot loader.
 - **Continue in Claude Desktop does nothing:** See which variants of the desktop app work under [Using it](#using-it).
 
 ## Known limitations

@@ -3,6 +3,12 @@
 All notable changes to Voice Commands, newest first. Fixes name the cause and the solution, so that a
 problem that comes back can be traced to how it was solved before.
 
+## 1.14.1 (2026-11-09)
+
+### Changes
+
+- When the kernel was updated together with the installation, the kernel module `overlay` cannot be loaded until the next start, and `sudo modprobe overlay` fails with `FATAL: Module overlay not found`. Cause: pacman deletes the modules of the old kernel, which keeps running. Solution: the installation and `voice-commands-setup` recognize this case (no folder for the running kernel in `/lib/modules`) and say to restart first; the README says it in the installation steps and the troubleshooting.
+
 ## 1.14.0 (2026-11-09)
 
 ### Fixes

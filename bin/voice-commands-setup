@@ -181,6 +181,10 @@ step "Background programs"
 # module overlay; the package loads it at boot and when it is installed
 if ! command -v bwrap >/dev/null; then
     problems+=("bubblewrap is missing, so Claude cannot start background programs. Install it: sudo pacman -S bubblewrap")
+elif ! bwrap --dev-bind / / --overlay-src "$HOME" --tmp-overlay "$HOME" true 2>/dev/null &&
+    [ ! -d "/lib/modules/$(uname -r)" ]; then
+    # pacman deleted the modules of the running kernel when it installed a new one
+    problems+=("Background programs need the kernel module overlay, which cannot be loaded: the kernel was updated, but the computer still runs the old one, whose modules are gone. Restart the computer, then run voice-commands-setup again. Until then, sudo modprobe overlay fails with 'FATAL: Module overlay not found'.")
 elif ! bwrap --dev-bind / / --overlay-src "$HOME" --tmp-overlay "$HOME" true 2>/dev/null; then
     problems+=("Background programs need the kernel module overlay, which is not loaded. Load it with: sudo modprobe overlay (the package loads it at every start of the computer). If modprobe says the module is not found, the kernel was updated since the last start: restart the computer.")
 else
