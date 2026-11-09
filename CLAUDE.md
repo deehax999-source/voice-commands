@@ -1,5 +1,13 @@
 # Voice Commands: project notes for Claude
 
+> [!NOTE]
+> **About this file:** `CLAUDE.md` holds the instructions that Claude Code reads when it works on this project: its l
+ayout, the development mode and the design decisions that must stay. It is not a user guide. To install and use Voice
+ Commands, read the [README](README.md). If you change the project with Claude Code yourself, Claude follows these no
+tes, so keep them up to date.
+
+-- 
+
 Spoken commands for Claude Code on Arch Linux. Talk to the user in their language, which is German.
 
 ## Layout
