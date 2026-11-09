@@ -75,6 +75,11 @@ msg() {
             nothing_send_detail) echo "Es läuft keine Aufnahme und kein Befehl wartet." ;;
             cancelled)        echo "🛑 Abgebrochen" ;;
             nothing_cancel)   echo "Nichts zum Abbrechen" ;;
+            update)           echo "Voice Commands $2 ist da" ;;
+            update_detail)    echo "Installiert ist $3. „Aktualisieren“ öffnet ein Terminal, das die neue Version holt, zeigt, was neu ist, und sie nach deinem Passwort installiert." ;;
+            update_button)    echo "Aktualisieren" ;;
+            no_terminal)      echo "Kein Terminal gefunden" ;;
+            no_terminal_detail) echo "Führe in einem Terminal aus: voice-commands update" ;;
         esac
     else
         case "$key" in
@@ -98,6 +103,11 @@ msg() {
             nothing_send_detail) echo "No recording is running and no command is waiting." ;;
             cancelled)        echo "🛑 Cancelled" ;;
             nothing_cancel)   echo "Nothing to cancel" ;;
+            update)           echo "Voice Commands $2 is available" ;;
+            update_detail)    echo "Installed is $3. “Update” opens a terminal that gets the new version, shows what changed and installs it after asking for your password." ;;
+            update_button)    echo "Update" ;;
+            no_terminal)      echo "No terminal found" ;;
+            no_terminal_detail) echo "Run in a terminal: voice-commands update" ;;
         esac
     fi
 }
@@ -192,12 +202,168 @@ clean_text() {
     "
 }
 
+# Once a day, at most, a voice command asks GitHub for the newest version and notifies once per new
+# version (setting update_check, on by default; the user chose this over a pacman repository, which
+# stops the whole system update when GitHub cannot be reached). Only the version number is read, the
+# PKGBUILD is never run. In development mode (programs from a source folder), git shows what is new.
+UPDATE_URL="https://raw.githubusercontent.com/deehax999-source/voice-commands/main/packaging/PKGBUILD"
+UPDATE_STATE="$HOME/.local/share/voice-commands/update-check"
+check_update() {
+    # Read directly: setting() drops false, because jq's // treats it as missing
+    [ "$(jq -r '.update_check' "$SETTINGS" 2>/dev/null)" = false ] && return 0
+    [ "$BIN" = /usr/bin ] || return 0
+    command -v vercmp >/dev/null && command -v curl >/dev/null || return 0
+    local installed checked=0 notified="" now latest pkgver pkgrel
+    installed="$(pacman -Q voice-commands 2>/dev/null)" || return 0
+    installed="${installed#voice-commands }"
+    # At most once in 24 hours (the user's wish): the lock keeps two commands at the same time from
+    # both asking, and the time is noted before asking, so that a failed request counts too
+    mkdir -p "$(dirname -- "$UPDATE_STATE")"
+    exec 7>"$UPDATE_STATE.lock"
+    flock -n 7 || return 0
+    if [ -f "$UPDATE_STATE" ]; then
+        read -r checked notified <"$UPDATE_STATE" || true
+        [[ "$checked" =~ ^[0-9]+$ ]] || checked=0
+    fi
+    now="$(date +%s)"
+    # A time in the future, after the clock was wrong, would otherwise stop the checks for good
+    if [ "$checked" -gt "$now" ]; then
+        printf '%s %s\n' "$now" "$notified" >"$UPDATE_STATE"
+        return 0
+    fi
+    [ $((now - checked)) -ge 86400 ] || return 0
+    # Noted before asking, so that a GitHub that cannot be reached is asked again only the next day
+    printf '%s %s\n' "$now" "$notified" >"$UPDATE_STATE"
+    latest="$(curl -fsSL --max-time 15 --proto =https "$UPDATE_URL" 2>/dev/null)" || return 0
+    pkgver="$(printf '%s\n' "$latest" | sed -n 's/^pkgver=\([0-9][0-9.]*\)$/\1/p' | head -n 1)"
+    pkgrel="$(printf '%s\n' "$latest" | sed -n 's/^pkgrel=\([0-9][0-9]*\)$/\1/p' | head -n 1)"
+    [ -n "$pkgver" ] && [ -n "$pkgrel" ] || return 0
+    latest="$pkgver-$pkgrel"
+    [ "$(vercmp "$latest" "$installed")" -gt 0 ] && [ "$latest" != "$notified" ] || return 0
+    printf '%s %s\n' "$now" "$latest" >"$UPDATE_STATE"
+    exec 7>&-
+    local action
+    action="$(notify-send -a "Voice Commands" -A update="$(msg update_button)" --wait \
+        "$(msg update "$pkgver")" "$(msg update_detail "$pkgver" "${installed%-*}")" 2>/dev/null)"
+    [ "$action" = update ] && update_terminal
+    return 0
+}
+
+# The newest version the check found, if it is newer than the installed one; for the response window
+update_available() {
+    [ "$BIN" = /usr/bin ] || return 0
+    [ "$(jq -r '.update_check' "$SETTINGS" 2>/dev/null)" = false ] && return 0
+    local installed checked notified=""
+    installed="$(pacman -Q voice-commands 2>/dev/null)" || return 0
+    installed="${installed#voice-commands }"
+    [ -f "$UPDATE_STATE" ] && read -r checked notified <"$UPDATE_STATE"
+    [[ "$notified" =~ ^[0-9][0-9.]*-[0-9]+$ ]] || return 0
+    [ "$(vercmp "$notified" "$installed")" -gt 0 ] && echo "${notified%-*}"
+    return 0
+}
+
+# Opens a terminal that runs the update, so that sudo asks for the password there as usual. The terminal
+# the user chose comes first: $TERMINAL, then xdg-terminal-exec (which follows the default terminal set
+# for it), then the desktop's default terminal (Plasma, GNOME, Cinnamon, MATE), then common terminals.
+default_terminals() {
+    printf '%s\n' "${TERMINAL:-}"
+    echo xdg-terminal-exec
+    local kde
+    for kde in kreadconfig6 kreadconfig5; do
+        command -v "$kde" >/dev/null && "$kde" --file kdeglobals --group General --key TerminalApplication 2>/dev/null
+    done
+    if command -v gsettings >/dev/null; then
+        gsettings get org.gnome.desktop.default-applications.terminal exec 2>/dev/null
+        gsettings get org.cinnamon.desktop.default-applications.terminal exec 2>/dev/null
+        gsettings get org.mate.applications-terminal exec 2>/dev/null
+    fi
+    printf '%s\n' kitty foot alacritty wezterm ghostty konsole gnome-terminal kgx ptyxis xfce4-terminal \
+        mate-terminal lxterminal qterminal tilix terminator terminology sakura rio st urxvt xterm
+}
+
+update_terminal() {
+    local terminal name update="$BIN/voice-commands"
+    while IFS= read -r terminal; do
+        # gsettings quotes its values, and $TERMINAL may carry options after the program
+        terminal="${terminal//\'/}"
+        terminal="${terminal%% *}"
+        [ -n "$terminal" ] && command -v "$terminal" >/dev/null || continue
+        name="${terminal##*/}"
+        case "$name" in
+            xdg-terminal-exec|kitty|foot) setsid -f "$terminal" "$update" update ;;
+            wezterm) setsid -f "$terminal" start -- "$update" update ;;
+            gnome-terminal|kgx|ptyxis) setsid -f "$terminal" -- "$update" update ;;
+            xfce4-terminal|mate-terminal|terminator) setsid -f "$terminal" -x "$update" update ;;
+            # Konsole, Alacritty, Ghostty, xterm and most others run a command after -e
+            *) setsid -f "$terminal" -e "$update" update ;;
+        esac >/dev/null 2>&1 </dev/null
+        return 0
+    done < <(default_terminals)
+    notify-send -a "Voice Commands" "$(msg no_terminal)" "$(msg no_terminal_detail)" 2>/dev/null
+    return 1
+}
+
+# Runs in the terminal: gets the newest version from GitHub into a fresh folder (the user's own copy of
+# the repository stays untouched, and nothing can be planted there between two updates), shows what
+# changed, builds the package as the user and installs it with makepkg, which asks for the password.
+# Messages are in plain English, like the setup.
+run_update() {
+    local dir installed new old_version rc=0
+    finish() { echo; read -rp "Press Enter to close this window. " _; exit "$rc"; }
+    echo "Voice Commands update"
+    echo
+    if ! command -v git >/dev/null || ! command -v makepkg >/dev/null || ! command -v updpkgsums >/dev/null; then
+        echo "Installing the tools needed to build the package:"
+        sudo pacman -S --needed git base-devel pacman-contrib || { rc=1; finish; }
+    fi
+    dir="$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/voice-commands-update.XXXXXX")" || { rc=1; finish; }
+    trap 'rm -rf -- "$dir"' EXIT
+    echo "Getting the newest version from GitHub …"
+    if ! git clone --quiet --depth 1 https://github.com/deehax999-source/voice-commands.git "$dir/source"; then
+        echo "GitHub cannot be reached right now. Try again later."
+        rc=1; finish
+    fi
+    new="$(sed -n 's/^pkgver=\([0-9][0-9.]*\)$/\1/p' "$dir/source/packaging/PKGBUILD" | head -n 1)"
+    installed="$(pacman -Q voice-commands 2>/dev/null)"
+    installed="${installed#voice-commands }"
+    old_version="${installed%-*}"
+    if [ -n "$installed" ]; then
+        echo "Installed: $old_version   Newest: $new"
+        if [ "$(vercmp "$new" "$old_version")" -le 0 ]; then
+            echo "You already have the newest version."
+            finish
+        fi
+        echo
+        echo "What changed:"
+        # The entries of CHANGELOG.md above the installed version
+        awk -v old="## $old_version " 'index($0, old) == 1 { exit } /^## [0-9]/ { show = 1 } show' \
+            "$dir/source/CHANGELOG.md"
+    fi
+    echo
+    (cd "$dir/source" && packaging/build-package.sh >/dev/null && cd aur && makepkg -si) || {
+        echo
+        echo "The update did not finish. Nothing was changed unless pacman says so above."
+        rc=1; finish
+    }
+    echo
+    echo "Running the setup of the new version:"
+    /usr/bin/voice-commands-setup || rc=1
+    if [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] && command -v hyprctl >/dev/null; then
+        hyprctl reload >/dev/null && echo "Hyprland reloaded its settings, so changed shortcuts apply."
+    fi
+    echo
+    echo "Voice Commands $new is installed. Reopen the response window to use the new version."
+    finish
+}
+
 run_task() {
     local text="$1" raw reply session rc when
     # What runs without a dialog right now, from the current settings; the permission hook enforces it
     local prompt="$SYSTEM_PROMPT" permissions
     permissions="$("$BIN/voice-commands-commands" permissions 2>/dev/null)"
     [ -z "$permissions" ] || prompt="$prompt"$'\n\n'"$permissions"
+    # In the background and without the queue lock, so that the command does not wait for it
+    check_update 9>&- 8>&- </dev/null >/dev/null 2>&1 &
     local args=(-p "$text" --output-format json --permission-mode dontAsk --settings "$HOOK_SETTINGS" --allowedTools "${ALLOWED[@]}"
                 --append-system-prompt "$prompt")
     # Uses the default model from Claude Code, unless VOICE_COMMANDS_MODEL or the
@@ -468,5 +634,9 @@ case "${1:-toggle}" in
     record-file) record_file ;;            # called by Claude Code after a file tool, see FILE_HOOK
     resume?) shift; wants_resume "$*" && echo yes || echo no ;;
     msg)     shift; msg "$@" ;;            # for testing the interface text
+    check-update) check_update ;;          # for testing the update check
+    update-available) update_available ;;  # for the response window
+    update-terminal) update_terminal ;;    # the update button
+    update)  run_update ;;                 # runs in the terminal
     *)       echo "Usage: voice-commands toggle|cancel|send|typed <text>|run <text>" >&2; exit 2 ;;
 esac

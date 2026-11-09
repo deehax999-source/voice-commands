@@ -195,6 +195,12 @@ if [ ! -e /usr/lib/modules-load.d/voice-commands.conf ] && [ ! -e /etc/modules-l
     problems+=("So that the kernel module overlay is loaded at every start of the computer without the package, run once: echo overlay | sudo tee /etc/modules-load.d/voice-commands.conf")
 fi
 
+# Version 1.14.2 had a pacman repository, which stops the whole system update when GitHub cannot be
+# reached; it is no longer updated
+if grep -qx '\[voice-commands\]' /etc/pacman.conf 2>/dev/null; then
+    problems+=("Remove the repository [voice-commands] from /etc/pacman.conf. It is no longer updated, and if GitHub cannot be reached, it stops the whole system update: sudo sed -i '/^\[voice-commands\]\$/,/^Server = https:\/\/github.com\/deehax999-source\/voice-commands\/releases\/download\/repo\$/d' /etc/pacman.conf")
+fi
+
 step "Claude Code"
 # Claude Code's own installer puts claude in ~/.local/bin, which is often not in PATH; voice-commands looks there too
 PATH="$HOME/.local/bin:$PATH"

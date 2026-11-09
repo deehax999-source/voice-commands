@@ -3,6 +3,16 @@
 All notable changes to Voice Commands, newest first. Fixes name the cause and the solution, so that a
 problem that comes back can be traced to how it was solved before.
 
+## 1.14.3 (2026-11-09)
+
+### Changes
+
+- Voice Commands reports new versions itself: at most once in 24 hours, a voice command asks GitHub for the version in `packaging/PKGBUILD` and shows a notification once per new version. It can be turned off in the settings under Privacy and does not run in development mode. The button Update in the notification and in the response window opens a terminal with the new command `voice-commands update`, which gets the newest version into a temporary folder, shows what changed, builds and installs it with `makepkg -si` (asking for the password there) and runs the setup.
+
+### Fixes
+
+- The pacman repository of 1.14.2 stopped the whole system update with "failed to synchronize all databases" when GitHub could not be reached. Cause: pacman stops when it cannot download the database of a repository and cannot mark one as optional; a local fallback server did not help, because pacman only takes it when it is newer than its own copy. Solution: the repository is no longer part of the installation, and `voice-commands-setup` gives the command that removes it from `pacman.conf`.
+
 ## 1.14.2 (2026-11-09)
 
 ### Changes

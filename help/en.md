@@ -74,6 +74,7 @@ The gear at the top right opens the settings. Changes only take effect when you 
 - **Time before starting:** 3, 5 or 10 seconds to cancel, or off. When it is off, a command starts as soon as it is recognized and can only be stopped with {cancel} while it runs.
 - **Keyboard shortcuts:** With **Change**, simply press the new combination. Meanwhile, the desktop's shortcuts are off for 20 seconds at most, so that every key arrives. Escape cancels. A key that is already used for something else is not taken. Free it first: on Hyprland in your Hyprland settings, on KDE Plasma in the system settings under Keyboard → Shortcuts, on GNOME in the settings under Keyboard → View and Customize Shortcuts. GNOME asks the first time whether the window may turn its shortcuts off for a moment. This works on Hyprland, KDE Plasma and GNOME; on other desktops, set the shortcuts in your keyboard settings.
 - **Keep conversations:** how long conversations, with everything Claude read, are kept.
+- **Look for updates:** At most once a day, a voice command asks GitHub for the newest version. If there is a new one, a notification names it once, and the response window shows it at the top. **Update** opens a terminal that gets the new version, shows what changed and installs it. There it asks for your password and whether to go on.
 - **Open when Claude is done:** shows every response in this window right away.
 - **Clear history:** deletes all saved responses and all conversations of voice commands in Claude Code's storage. No conversation can be continued afterwards. Files Claude saved in `~/Voice-Commands` are kept.
 
@@ -81,6 +82,7 @@ The gear at the top right opens the settings. Changes only take effect when you 
 
 - **Stays on your computer:** your voice, speech recognition and reading aloud.
 - **Goes to Anthropic:** the recognized text, everything Claude is allowed to read, and the screenshots of background programs. Voice commands count towards your Claude plan's limits.
+- **Goes to GitHub:** at most once a day the question for the newest version, so GitHub sees your IP address. Turn it off under **Settings → Privacy**.
 - **Kept:** the last 50 responses and the last 1000 lines of the log in `~/Voice-Commands`. Screenshots are only kept in memory. They are deleted when the background programs close, or at the latest when you shut down or log out.
 - **Claude Code's conversation files:** Claude Code saves each conversation in `~/.claude/projects`, with everything Claude read, including the screenshots it looked at. Voice Commands deletes its own conversations after the time you choose in **Settings → Privacy**: 1, 7 or 30 days, 7 by default. After that, they can no longer be continued or opened in Claude Desktop. Your other Claude Code sessions stay unchanged.
 - Whatever Claude saves for you in `~/Voice-Commands` belongs to you and is never deleted automatically.

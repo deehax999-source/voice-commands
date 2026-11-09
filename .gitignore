@@ -19,8 +19,3 @@ __pycache__/
 # Test recordings and access data that must never be committed
 *.wav
 .env
-
-# Private notes: this computer, the project status and changes before the first public release
-CLAUDE.local.md
-CHANGELOG.local.md
-.claude/settings.local.json

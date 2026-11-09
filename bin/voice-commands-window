@@ -158,6 +158,8 @@ TEXT = {
            "folder_tips": "Worauf du achten solltest",
            "folder_tips_body": "• Gib nur die Ordner frei, die Claude wirklich braucht. Je kleiner, desto besser: lieber „~/Dokumente/Steuer“ als „~/Dokumente“.\n• Alles, was Claude liest, wird an Anthropic gesendet. Gib keine Ordner mit privaten Fotos, Ausweisen, Verträgen, Gesundheits- oder Bankdaten frei.\n• Passwörter und Schlüssel erkennt Voice Commands nur an bekannten Namen wie ~/.ssh oder .env. Andere Zugangsdaten, etwa in einer eigenen Notiz, liest Claude in freigegebenen Ordnern ohne Rückfrage.\n• Meide Einstellungsordner wie ~/.config oder ~/.local. Dort liegen oft Anmeldungen, Verläufe und Schlüssel.\n• Wähle „Lesen und ändern“ nur, wenn Claude dort wirklich schreiben soll und du eine Sicherung hast. Fehler lassen sich oft nicht rückgängig machen.\n• Sei vorsichtig mit Ordnern, die mit einer Cloud oder anderen Geräten synchronisiert werden: Änderungen landen dann auch dort.\n• Webseiten und Dateien können versteckte Anweisungen enthalten. In freigegebenen Ordnern fragt dich dann niemand mehr.\n• Entferne Freigaben, die du nicht mehr brauchst.",
            "privacy": "Datenschutz", "keep": "Gespräche aufbewahren",
+           "update_check": "Nach Updates suchen",
+           "update_check_sub": "Ein Sprachbefehl fragt höchstens einmal am Tag bei GitHub nach der neuesten Version und meldet eine neue. GitHub sieht dabei deine IP-Adresse.",
            "keep_sub": "Claude Code speichert jedes Gespräch mit allem, was Claude gelesen hat, auch Bildschirmfotos. Danach werden sie gelöscht und lassen sich nicht mehr fortsetzen.",
            "keep_options": ["1 Tag", "7 Tage", "30 Tage"],
            "clear": "Verlauf löschen", "clear_title": "Verlauf löschen?",
@@ -182,6 +184,7 @@ TEXT = {
            "classic": "sie brauchen Hyprlands Lua-Einstellungen (hyprland.lua), die klassische hyprland.conf wird nicht unterstützt",
            "missing": "{combo} funktioniert nicht", "conflict": "{combo} ist auch anderweitig belegt",
            "banner": "Tastenkürzel: {problems}.", "banner_button": "Einstellungen",
+           "update_banner": "Voice Commands {version} ist da.", "update_banner_button": "Aktualisieren",
            "used_title": "Taste schon belegt",
            "used_body": "{combo} ist in Hyprland schon belegt: {uses}.\n\nMach die Taste zuerst in deinen Hyprland-Einstellungen in ~/.config/hypr frei und übernimm das Kürzel dann noch einmal. Oder wähle eine andere Taste.",
            "used_reset": "Diese Standardkürzel sind in Hyprland schon belegt und wurden nicht übernommen:\n\n{list}\n\nMach die Tasten zuerst in deinen Hyprland-Einstellungen in ~/.config/hypr frei und stelle den Standard dann noch einmal wieder her.",
@@ -295,6 +298,8 @@ TEXT = {
            "folder_tips": "What to watch out for",
            "folder_tips_body": "• Share only the folders Claude really needs. The smaller, the better: rather \"~/Documents/Taxes\" than \"~/Documents\".\n• Everything Claude reads is sent to Anthropic. Do not share folders with private photos, ID documents, contracts, health or bank data.\n• Voice Commands recognizes passwords and keys only by known names such as ~/.ssh or .env. Claude reads other access data in shared folders without a dialog, for example in a note of your own.\n• Avoid settings folders such as ~/.config or ~/.local. They often hold logins, histories and keys.\n• Choose \"Read and change\" only if Claude really needs to write there and you have a backup. Mistakes often cannot be undone.\n• Be careful with folders that sync to a cloud or other devices: changes end up there as well.\n• Websites and files can contain hidden instructions. In shared folders, nobody asks you anymore.\n• Remove shares you no longer need.",
            "privacy": "Privacy", "keep": "Keep conversations",
+           "update_check": "Look for updates",
+           "update_check_sub": "At most once a day, a voice command asks GitHub for the newest version and reports a new one. GitHub sees your IP address.",
            "keep_sub": "Claude Code saves each conversation with everything Claude read, including screenshots. Afterwards they are deleted and can no longer be continued.",
            "keep_options": ["1 day", "7 days", "30 days"],
            "clear": "Clear history", "clear_title": "Clear history?",
@@ -319,6 +324,7 @@ TEXT = {
            "classic": "they need Hyprland's Lua settings (hyprland.lua), the classic hyprland.conf is not supported",
            "missing": "{combo} does not work", "conflict": "{combo} is also used for something else",
            "banner": "Keyboard shortcuts: {problems}.", "banner_button": "Settings",
+           "update_banner": "Voice Commands {version} is available.", "update_banner_button": "Update",
            "used_title": "Key already in use",
            "used_body": "{combo} is already used in Hyprland: {uses}.\n\nFirst free the key in your Hyprland settings in ~/.config/hypr, then apply the shortcut again. Or choose another key.",
            "used_reset": "These default shortcuts are already used in Hyprland and were not applied:\n\n{list}\n\nFirst free the keys in your Hyprland settings in ~/.config/hypr, then restore the defaults again.",
@@ -363,7 +369,7 @@ def model_picker():
 
 
 DEFAULTS = {"shortcuts": {}, "shortcuts_kde": {}, "shortcuts_gnome": {}, "speak": False, "speak_scope": "first", "speak_rate": "normal",
-            "recognition_language": "system", "countdown": 5, "open_window": False, "keep_sessions": 7, "followup": 5,
+            "recognition_language": "system", "countdown": 5, "open_window": False, "update_check": True, "keep_sessions": 7, "followup": 5,
             "folders": [], "appearance": "system", "commands_off": [], "own_commands": [], "file_command_scopes": {}, "file_command_custom": {}}
 SCOPES = ["first", "all"]
 RATES = ["slow", "normal", "fast"]
@@ -1349,6 +1355,9 @@ def settings_dialog(window):
     keep.set_subtitle_lines(0)
 
     privacy.add(keep)
+    updates = switch_row(LABELS["update_check"], LABELS["update_check_sub"], "update_check", settings)
+    updates.set_subtitle_lines(0)
+    privacy.add(updates)
     page.add(privacy)
 
     responses = Adw.PreferencesGroup(title=LABELS["window"])
@@ -1980,6 +1989,10 @@ class Window(Adw.ApplicationWindow):
         self.banner = Adw.Banner(button_label=LABELS["banner_button"])
         self.banner.connect("button-clicked", lambda _banner: settings_dialog(self))
         toolbar.add_top_bar(self.banner)
+        # A new version the daily check found; the button opens a terminal that runs the update
+        self.update_banner = Adw.Banner(button_label=LABELS["update_banner_button"])
+        self.update_banner.connect("button-clicked", lambda _banner: self.start_update())
+        toolbar.add_top_bar(self.update_banner)
         self.toasts = Adw.ToastOverlay(child=scroller)
         self.pending = []
         self.connect("close-request", self.on_close)
@@ -2134,9 +2147,25 @@ class Window(Adw.ApplicationWindow):
             self.banner.set_title(LABELS["banner"].format(problems=", ".join(problems)))
         self.banner.set_revealed(bool(problems))
 
+    def check_update(self):
+        try:
+            result = subprocess.run([str(BIN / "voice-commands"), "update-available"], capture_output=True,
+                                    text=True, timeout=5)
+            version = result.stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            version = ""
+        if version:
+            self.update_banner.set_title(LABELS["update_banner"].format(version=version))
+        self.update_banner.set_revealed(bool(version))
+
+    def start_update(self):
+        subprocess.Popen([str(BIN / "voice-commands"), "update-terminal"], start_new_session=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
     def recheck(self):
-        """Asks the helpers about shortcuts and voices; slower than a refresh, so only on opening and applying."""
+        """Asks the helpers about shortcuts, voices and updates; slower than a refresh, so only on opening and applying."""
         self.check_shortcuts()
+        self.check_update()
         self.can_speak = speech_engine() != "none"
 
     def refresh(self):
