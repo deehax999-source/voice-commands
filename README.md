@@ -65,7 +65,19 @@ The status bar needs a Wayland desktop with layer-shell support. On Hyprland, a 
 
 If Claude Code is not installed yet, install it as described in [Claude Code's setup guide](https://code.claude.com/docs/en/setup), then run `claude` once and sign in.
 
-Build the package from this repository. The first command updates your system and installs the tools needed to build the package. On Arch, always update before installing new packages, otherwise downloads can fail with "failed to retrieve some files".
+Install the package from Voice Commands' own pacman repository. The first command adds the repository to `/etc/pacman.conf`, the second updates your system and installs Voice Commands. On Arch, always update before installing new packages, otherwise downloads can fail with "failed to retrieve some files".
+
+```bash
+printf '\n[voice-commands]\nSigLevel = Optional TrustAll\nServer = https://github.com/deehax999-source/voice-commands/releases/download/repo\n' | sudo tee -a /etc/pacman.conf
+sudo pacman -Syu voice-commands
+voice-commands-setup
+```
+
+The repository is a release of this GitHub repository. Its packages are not signed: pacman trusts them because they come over HTTPS from this repository, so whoever controls this GitHub account could give you a different package, which pacman installs with root rights. If you do not want that, build the package yourself, as below. Updates come with every `sudo pacman -Syu`, and update tools such as cachy-update or Shelly show them like other updates.
+
+The package also makes the computer load the kernel module `overlay` at every start (`/usr/lib/modules-load.d/voice-commands.conf`), which the protected area for background programs needs, and loads it right away. pacman asks for your password and installs the missing dependencies. If pacman asks which of several packages to install, pressing Enter takes the default.
+
+To build the package yourself instead, without the repository:
 
 ```bash
 sudo pacman -Syu --needed git base-devel pacman-contrib
@@ -76,10 +88,10 @@ cd aur && makepkg -si
 voice-commands-setup
 ```
 
-The package also makes the computer load the kernel module `overlay` at every start (`/usr/lib/modules-load.d/voice-commands.conf`), which the protected area for background programs needs, and loads it right away. `build-package.sh` also writes the checksums of the files into the package description; `packaging/PKGBUILD` in the repository has none on its own, so build with the script, not from that file directly. `makepkg -si` asks for your password and installs the missing dependencies. If pacman asks which of several packages to install, pressing Enter takes the default.
+`build-package.sh` also writes the checksums of the files into the package description; `packaging/PKGBUILD` in the repository has none on its own, so build with the script, not from that file directly.
 
 > [!IMPORTANT]
-> If the first command updated the kernel, restart the computer before `voice-commands-setup`. pacman deletes the modules of the old kernel, and the computer keeps running the old one until the next start, so the kernel module `overlay` cannot be loaded: the installation says so, `voice-commands-setup` reports that the overlay is not loaded, and `sudo modprobe overlay` fails with `FATAL: Module overlay not found in directory /lib/modules/…`. After the restart it loads by itself.
+> If `pacman -Syu` updated the kernel, restart the computer before `voice-commands-setup`. pacman deletes the modules of the old kernel, and the computer keeps running the old one until the next start, so the kernel module `overlay` cannot be loaded: the installation says so, `voice-commands-setup` reports that the overlay is not loaded, and `sudo modprobe overlay` fails with `FATAL: Module overlay not found in directory /lib/modules/…`. After the restart it loads by itself.
 
 Run `voice-commands-setup` as your normal user, not with `sudo`, in a terminal of your desktop session, so that it can add the shortcuts.
 
@@ -236,7 +248,14 @@ More rules:
 
 ## Update
 
-In your copy of the repository:
+With the repository, Voice Commands is updated with the rest of your system:
+
+```bash
+sudo pacman -Syu
+voice-commands-setup
+```
+
+If you built the package yourself, in your copy of the repository:
 
 ```bash
 sudo pacman -Syu
@@ -246,7 +265,7 @@ cd aur && makepkg -si
 voice-commands-setup
 ```
 
-You get no update notifications this way. Changed keyboard shortcuts on Hyprland take effect after `hyprctl reload`.
+Built this way, you get no update notifications. A package you built yourself is replaced by the repository's with the next newer version, once you add the repository. Changed keyboard shortcuts on Hyprland take effect after `hyprctl reload`.
 
 ## Uninstall
 
@@ -256,6 +275,7 @@ sudo pacman -Rns voice-commands
 
 Then remove these by hand:
 
+- the section `[voice-commands]` in `/etc/pacman.conf`, if you added the repository
 - on Hyprland, the Voice Commands lines in `~/.config/hypr/hyprland.lua`, and the file `~/.config/hypr/config/voice-commands.lua` if it exists
 - on KDE Plasma, the files `~/.local/share/applications/local.voicecommands.*.desktop`; Plasma then drops their shortcuts
 - on GNOME, the shortcuts "Voice Commands: ..." in the settings under Keyboard, View and Customize Shortcuts, Custom Shortcuts
@@ -325,7 +345,7 @@ To try changes without installing, run `bin/voice-commands-setup` from your copy
 
 `tests/permission-hook.sh` tests the permission check and the protected area of background programs with over 160 cases in a temporary home folder, without touching yours and without opening a window (`-v` lists every case). Run it after every change to `voice-commands-permission`, `voice-commands-commands` or `voice-commands-bg`. The cases for the protected area need the kernel module `overlay` and are skipped otherwise.
 
-For a new version, raise `pkgver` or `pkgrel` in `packaging/PKGBUILD`. `packaging/build-package.sh` builds the package folder `aur/`, from which `makepkg` builds the package. Notable changes are listed in [CHANGELOG.md](CHANGELOG.md).
+For a new version, raise `pkgver` or `pkgrel` in `packaging/PKGBUILD`. `packaging/build-package.sh` builds the package folder `aur/`, from which `makepkg` builds the package. After committing and pushing, the maintainer runs `packaging/publish-repo.sh`, which builds the package, makes a new repository database with only this version and uploads both to the release `repo`. Notable changes are listed in [CHANGELOG.md](CHANGELOG.md).
 
 Not stored in this repository: speech recognition files and voices (downloaded by `voice-commands-setup`) and the response history and log in `~/Voice-Commands`.
 

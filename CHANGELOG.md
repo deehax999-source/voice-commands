@@ -3,6 +3,12 @@
 All notable changes to Voice Commands, newest first. Fixes name the cause and the solution, so that a
 problem that comes back can be traced to how it was solved before.
 
+## 1.14.2 (2026-11-09)
+
+### Changes
+
+- Voice Commands has its own pacman repository, a release of the GitHub repository, so that `sudo pacman -Syu` and update tools such as cachy-update or Shelly get new versions. The README installs from it; building the package yourself still works. The packages are not signed, which the README explains.
+
 ## 1.14.1 (2026-11-09)
 
 ### Changes
